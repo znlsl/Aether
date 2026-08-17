@@ -243,3 +243,37 @@ CREATE TABLE IF NOT EXISTS usage_settlement_snapshots (
     KEY ix_usage_settlement_snapshots_pricing_source (`billing_pricing_source`)
 );
 
+CREATE TABLE IF NOT EXISTS usage_cost_reservations (
+    `request_id` VARCHAR(128) NOT NULL,
+    `subject_id` VARCHAR(128) NOT NULL,
+    `reservation_token` VARCHAR(128) NOT NULL,
+    `admitted_at` BIGINT NOT NULL,
+    `reserved_cost_units` BIGINT NOT NULL,
+    `actual_cost_units` BIGINT,
+    `state` VARCHAR(20) NOT NULL,
+    `reservation_expires_at` BIGINT NOT NULL,
+    `retain_until` BIGINT NOT NULL,
+    `finalized_at` BIGINT,
+    `created_at` BIGINT NOT NULL,
+    `updated_at` BIGINT NOT NULL,
+    PRIMARY KEY (`reservation_token`),
+    KEY usage_cost_reservations_request_id_idx (`request_id`),
+    KEY usage_cost_reservations_subject_admitted_at_idx (`subject_id`, `admitted_at`),
+    KEY usage_cost_reservations_reservation_expires_at_idx (`reservation_expires_at`),
+    KEY usage_cost_reservations_retain_until_token_idx (`retain_until`, `reservation_token`)
+);
+
+CREATE TABLE IF NOT EXISTS usage_request_admissions (
+    `request_id` VARCHAR(128) NOT NULL,
+    `subject_id` VARCHAR(128) NOT NULL,
+    `event_token` VARCHAR(128) NOT NULL,
+    `admitted_at` BIGINT NOT NULL,
+    `retain_until` BIGINT NOT NULL,
+    `state` VARCHAR(20) NOT NULL,
+    `released_at` BIGINT,
+    `created_at` BIGINT NOT NULL,
+    PRIMARY KEY (`event_token`),
+    KEY usage_request_admissions_subject_admitted_at_idx (`subject_id`, `admitted_at`),
+    KEY usage_request_admissions_retain_until_token_idx (`retain_until`, `event_token`)
+);
+

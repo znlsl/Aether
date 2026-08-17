@@ -279,7 +279,7 @@ pub(crate) fn spawn_stats_aggregation_worker(app: AppState) -> Option<tokio::tas
 }
 
 pub(crate) fn spawn_usage_cleanup_worker(app: AppState) -> Option<tokio::task::JoinHandle<()>> {
-    if !app.data.has_usage_writer() {
+    if !app.data.has_usage_writer() && !app.data.has_settlement_writer() {
         return None;
     }
 

@@ -7,6 +7,7 @@ use crate::redis::{
 };
 use crate::{
     DataLayerError, RateLimitCheck, RateLimitInput, RateLimitScope, RuntimeSemaphoreError,
+    UsageLimitCheck, UsageLimitInput, UsageLimitReleaseInput,
 };
 
 const RATE_LIMIT_CHECK_AND_CONSUME_SCRIPT: &str = r#"
@@ -49,6 +50,50 @@ if key_limit > 0 then
 end
 
 return {1, 0, 0, remaining}
+"#;
+
+const USAGE_LIMIT_CHECK_AND_CONSUME_SCRIPT: &str = r#"
+local count = #KEYS
+local now = tonumber(ARGV[1])
+local event_id = ARGV[2]
+
+for i = 1, count do
+    local window_ms = tonumber(ARGV[(i - 1) * 3 + 4]) * 1000
+    local cutoff = now - window_ms
+    redis.call('ZREMRANGEBYSCORE', KEYS[i], '-inf', cutoff)
+end
+
+for i = 1, count do
+    local limit = tonumber(ARGV[(i - 1) * 3 + 3])
+    local window_ms = tonumber(ARGV[(i - 1) * 3 + 4]) * 1000
+    local already_consumed = redis.call('ZSCORE', KEYS[i], event_id)
+    if not already_consumed then
+        local current = redis.call('ZCARD', KEYS[i])
+        if current >= limit then
+            local earliest = redis.call('ZRANGE', KEYS[i], 0, 0, 'WITHSCORES')
+            local retry_after = 1
+            if #earliest >= 2 then
+                local retry_after_ms = math.max(1, tonumber(earliest[2]) + window_ms - now)
+                retry_after = math.ceil(retry_after_ms / 1000)
+            end
+            return {0, i, limit, retry_after}
+        end
+    end
+end
+
+for i = 1, count do
+    local retention = tonumber(ARGV[(i - 1) * 3 + 5])
+    redis.call('ZADD', KEYS[i], 'NX', now, event_id)
+    redis.call('EXPIRE', KEYS[i], retention + 1)
+end
+return {1, 0, 0, 0}
+"#;
+
+const USAGE_LIMIT_RELEASE_SCRIPT: &str = r#"
+for i = 1, #KEYS do
+    redis.call('ZREM', KEYS[i], ARGV[1])
+end
+return 1
 "#;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -280,6 +325,105 @@ impl RedisRuntimeRunner {
                 RateLimitScope::Key => input.key_limit,
             });
         Ok(RateLimitCheck::Rejected { scope, limit })
+    }
+
+    pub(crate) async fn check_and_consume_usage_limits(
+        &self,
+        input: UsageLimitInput<'_>,
+    ) -> Result<UsageLimitCheck, DataLayerError> {
+        let script = script(USAGE_LIMIT_CHECK_AND_CONSUME_SCRIPT);
+        let mut invocation = script.prepare_invoke();
+        for rule in input.rules {
+            invocation.key(self.keyspace.key(rule.key));
+        }
+        invocation.arg(input.now_unix_ms as i64);
+        invocation.arg(input.event_id);
+        for rule in input.rules {
+            invocation.arg(rule.limit as i64);
+            invocation.arg(rule.window_seconds as i64);
+            invocation.arg(rule.retention_seconds as i64);
+        }
+        let raw = run_lane_with_timeout(
+            &self.connections,
+            RedisConnectionLane::Fast,
+            self.command_timeout_ms,
+            "runtime usage limit check",
+            async {
+                let mut connection = self.connections.connection(RedisConnectionLane::Fast);
+                invocation
+                    .invoke_async::<Vec<i64>>(&mut connection)
+                    .await
+                    .map_redis_err()
+            },
+        )
+        .await?;
+        match raw.first().copied() {
+            Some(1) if raw.len() >= 4 => return Ok(UsageLimitCheck::Allowed),
+            Some(0) if raw.len() >= 4 => {}
+            _ => {
+                return Err(DataLayerError::UnexpectedValue(
+                    "runtime usage limit script returned an invalid response".to_string(),
+                ));
+            }
+        }
+        let rule_index = raw
+            .get(1)
+            .copied()
+            .and_then(|value| usize::try_from(value.saturating_sub(1)).ok())
+            .filter(|index| *index < input.rules.len())
+            .ok_or_else(|| {
+                DataLayerError::UnexpectedValue(
+                    "runtime usage limit script returned an invalid rule index".to_string(),
+                )
+            })?;
+        let limit = raw
+            .get(2)
+            .copied()
+            .and_then(|value| u64::try_from(value).ok())
+            .filter(|limit| *limit > 0)
+            .ok_or_else(|| {
+                DataLayerError::UnexpectedValue(
+                    "runtime usage limit script returned an invalid limit".to_string(),
+                )
+            })?;
+        let retry_after = raw
+            .get(3)
+            .copied()
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or(1)
+            .max(1);
+        Ok(UsageLimitCheck::Rejected {
+            rule_index,
+            limit,
+            retry_after,
+        })
+    }
+
+    pub(crate) async fn release_usage_limits(
+        &self,
+        input: UsageLimitReleaseInput<'_>,
+    ) -> Result<(), DataLayerError> {
+        let script = script(USAGE_LIMIT_RELEASE_SCRIPT);
+        let mut invocation = script.prepare_invoke();
+        for rule in input.rules {
+            invocation.key(self.keyspace.key(rule.key));
+        }
+        invocation.arg(input.event_id);
+        run_lane_with_timeout(
+            &self.connections,
+            RedisConnectionLane::Fast,
+            self.command_timeout_ms,
+            "runtime usage limit release",
+            async {
+                let mut connection = self.connections.connection(RedisConnectionLane::Fast);
+                invocation
+                    .invoke_async::<i64>(&mut connection)
+                    .await
+                    .map_redis_err()
+            },
+        )
+        .await?;
+        Ok(())
     }
 
     pub(crate) async fn set_add(&self, key: &str, member: &str) -> Result<bool, DataLayerError> {

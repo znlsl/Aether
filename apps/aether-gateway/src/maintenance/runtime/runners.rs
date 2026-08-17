@@ -12,12 +12,12 @@ use super::{
     cleanup_expired_gemini_file_mappings_once, cleanup_proxy_node_metrics_once,
     cleanup_request_candidates_once, cleanup_stale_pending_requests_once,
     cleanup_stale_proxy_nodes_once, collect_proxy_upgrade_rollout_probes, now_unix_secs,
-    perform_db_maintenance_once, perform_manual_usage_cleanup_once, perform_provider_checkin_once,
+    perform_automatic_usage_cleanup_once, perform_db_maintenance_once,
+    perform_manual_usage_cleanup_once, perform_provider_checkin_once,
     perform_stats_aggregation_once, perform_stats_hourly_aggregation_once,
-    perform_usage_cleanup_once, perform_wallet_daily_usage_aggregation_once,
-    record_admin_cleanup_run, record_completed_cleanup_run, record_failed_cleanup_run,
-    record_proxy_upgrade_traffic_success, summarize_database_pool, AdminCleanupRunRecord,
-    ManualUsageCleanupOptions,
+    perform_wallet_daily_usage_aggregation_once, record_admin_cleanup_run,
+    record_completed_cleanup_run, record_failed_cleanup_run, record_proxy_upgrade_traffic_success,
+    summarize_database_pool, AdminCleanupRunRecord, ManualUsageCleanupOptions,
 };
 
 pub(super) async fn run_audit_cleanup_once(data: &GatewayDataState) -> Result<(), DataLayerError> {
@@ -237,7 +237,7 @@ pub(super) async fn run_stats_aggregation_once(
 pub(super) async fn run_usage_cleanup_once(data: &GatewayDataState) -> Result<(), DataLayerError> {
     let started_at_unix_secs = now_unix_secs();
     let started_at = Instant::now();
-    let summary = match perform_usage_cleanup_once(data).await {
+    let summary = match perform_automatic_usage_cleanup_once(data).await {
         Ok(summary) => summary,
         Err(err) => {
             record_failed_cleanup_run(
@@ -265,6 +265,8 @@ pub(super) async fn run_usage_cleanup_once(data: &GatewayDataState) -> Result<()
             "header_cleaned": summary.header_cleaned,
             "keys_cleaned": summary.keys_cleaned,
             "records_deleted": summary.records_deleted,
+            "cost_reservations_deleted": summary.cost_reservations_deleted,
+            "request_admissions_deleted": summary.request_admissions_deleted,
         }),
         format!(
             "请求记录自动清理完成，影响 {} 项",
@@ -275,6 +277,8 @@ pub(super) async fn run_usage_cleanup_once(data: &GatewayDataState) -> Result<()
                 .saturating_add(summary.header_cleaned)
                 .saturating_add(summary.keys_cleaned)
                 .saturating_add(summary.records_deleted)
+                .saturating_add(summary.cost_reservations_deleted)
+                .saturating_add(summary.request_admissions_deleted)
         ),
     )
     .await;
@@ -284,6 +288,8 @@ pub(super) async fn run_usage_cleanup_once(data: &GatewayDataState) -> Result<()
         || summary.header_cleaned > 0
         || summary.keys_cleaned > 0
         || summary.records_deleted > 0
+        || summary.cost_reservations_deleted > 0
+        || summary.request_admissions_deleted > 0
     {
         info!(
             event_name = "usage_cleanup_completed",
@@ -295,6 +301,8 @@ pub(super) async fn run_usage_cleanup_once(data: &GatewayDataState) -> Result<()
             header_cleaned = summary.header_cleaned,
             keys_cleaned = summary.keys_cleaned,
             records_deleted = summary.records_deleted,
+            cost_reservations_deleted = summary.cost_reservations_deleted,
+            request_admissions_deleted = summary.request_admissions_deleted,
             "gateway finished usage cleanup"
         );
     }
@@ -384,6 +392,8 @@ pub(crate) async fn run_manual_usage_cleanup_once(
             "header_cleaned": summary.header_cleaned,
             "keys_cleaned": summary.keys_cleaned,
             "records_deleted": summary.records_deleted,
+            "cost_reservations_deleted": summary.cost_reservations_deleted,
+            "request_admissions_deleted": summary.request_admissions_deleted,
             "mode": options.mode.as_str(),
             "requested_older_than_days": options.requested_older_than_days,
             "targets": options.targets,
@@ -401,6 +411,8 @@ pub(crate) async fn run_manual_usage_cleanup_once(
         requested_older_than_days = options.requested_older_than_days,
         actor_user_id = actor_user_id.as_deref(),
         total_affected = total,
+        cost_reservations_deleted = summary.cost_reservations_deleted,
+        request_admissions_deleted = summary.request_admissions_deleted,
         "gateway finished manual usage cleanup"
     );
     Ok(summary)
@@ -496,6 +508,8 @@ fn usage_cleanup_total(
         .saturating_add(summary.header_cleaned)
         .saturating_add(summary.keys_cleaned)
         .saturating_add(summary.records_deleted)
+        .saturating_add(summary.cost_reservations_deleted)
+        .saturating_add(summary.request_admissions_deleted)
 }
 
 fn manual_usage_cleanup_start_message(options: ManualUsageCleanupOptions) -> String {
@@ -549,6 +563,8 @@ fn manual_usage_cleanup_progress_summary(
         "header_cleaned": summary.header_cleaned,
         "keys_cleaned": summary.keys_cleaned,
         "records_deleted": summary.records_deleted,
+        "cost_reservations_deleted": summary.cost_reservations_deleted,
+        "request_admissions_deleted": summary.request_admissions_deleted,
         "total": usage_cleanup_total(summary),
         "actor_user_id": actor_user_id,
     })

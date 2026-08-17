@@ -90,7 +90,7 @@ pub(crate) async fn maybe_execute_via_sync_decision_path(
         plan_kind,
         bypass_cache_key,
         scheduler_supported: supports_sync_execution_decision_kind(plan_kind),
-        transfer_tracker: ProviderTransferTracker::default(),
+        transfer_tracker: ProviderTransferTracker::for_request(parts),
     };
 
     Ok(from_ai_serving_outcome(

@@ -6,6 +6,10 @@ use aether_data::repository::proxy_nodes::{
     bucket_start_unix_secs, InMemoryProxyNodeRepository, ProxyNodeHeartbeatMutation,
     ProxyNodeMetricsStep, ProxyNodeReadRepository, ProxyNodeWriteRepository, StoredProxyNode,
 };
+use aether_data::repository::settlement::{
+    InMemorySettlementRepository, ReserveUsagePolicyCostInput, ReserveUsagePolicyRequestInput,
+    SettlementWriteRepository, UsagePolicyCostWindow, UsagePolicyRequestWindow,
+};
 use aether_runtime::bounded_queue;
 use axum::extract::ws::Message;
 use chrono::{DateTime, Utc};
@@ -18,7 +22,8 @@ use super::{
     cleanup_proxy_node_metrics_once, cleanup_stale_proxy_nodes_once, inspect_proxy_upgrade_rollout,
     next_daily_run_after, next_db_maintenance_run_after, next_stats_aggregation_run_after,
     next_stats_hourly_aggregation_run_after, pending_cleanup_batch_size,
-    pending_cleanup_timeout_minutes, plan_pending_cleanup_batch, provider_checkin_schedule,
+    pending_cleanup_timeout_minutes, perform_automatic_usage_cleanup_once,
+    perform_manual_usage_cleanup_once, plan_pending_cleanup_batch, provider_checkin_schedule,
     proxy_node_metrics_cleanup_settings, record_proxy_upgrade_traffic_success,
     run_db_maintenance_with, run_proxy_upgrade_rollout_once, spawn_account_self_check_worker,
     spawn_audit_cleanup_worker, spawn_db_maintenance_worker,
@@ -592,6 +597,106 @@ async fn spawn_usage_cleanup_worker_skips_when_usage_writer_unavailable() {
         .expect("gateway state should build")
         .with_data_state_for_tests(GatewayDataState::disabled());
     assert!(spawn_usage_cleanup_worker(state).is_none());
+}
+
+#[tokio::test]
+async fn spawn_usage_cleanup_worker_starts_for_settlement_writer_only() {
+    let state = AppState::new()
+        .expect("gateway state should build")
+        .with_data_state_for_tests(
+            GatewayDataState::disabled().with_settlement_writer_for_tests(Arc::new(
+                InMemorySettlementRepository::default(),
+            )),
+        );
+    let handle = spawn_usage_cleanup_worker(state)
+        .expect("settlement ledger cleanup should have a worker without a usage writer");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn automatic_usage_cleanup_collects_ledgers_when_usage_cleanup_is_disabled() {
+    let repository = Arc::new(InMemorySettlementRepository::default());
+    repository
+        .reserve_usage_policy_request(ReserveUsagePolicyRequestInput {
+            request_id: "expired-request".to_string(),
+            subject_id: "user-1".to_string(),
+            event_token: "expired-event".to_string(),
+            admitted_at_unix_secs: 1,
+            retain_until_unix_secs: 2,
+            windows: vec![UsagePolicyRequestWindow {
+                starts_at_unix_secs: 0,
+                ends_at_unix_secs: 2,
+                limit_requests: 10,
+            }],
+        })
+        .await
+        .expect("request admission should be seeded");
+    repository
+        .reserve_usage_policy_cost(ReserveUsagePolicyCostInput {
+            request_id: "expired-cost".to_string(),
+            subject_id: "user-1".to_string(),
+            reservation_token: "expired-reservation".to_string(),
+            admitted_at_unix_secs: 1,
+            reserved_cost_units: 1,
+            reservation_expires_at_unix_secs: 2,
+            retain_until_unix_secs: 2,
+            windows: vec![UsagePolicyCostWindow {
+                window_id: "expired-window".to_string(),
+                starts_at_unix_secs: 0,
+                ends_at_unix_secs: 2,
+                limit_cost_units: 10,
+            }],
+        })
+        .await
+        .expect("cost reservation should be seeded");
+    let data = GatewayDataState::disabled()
+        .with_settlement_writer_for_tests(repository)
+        .with_system_config_values_for_tests([
+            ("enable_auto_cleanup".to_string(), json!(false)),
+            ("cleanup_batch_size".to_string(), json!(1)),
+        ]);
+
+    let summary = perform_automatic_usage_cleanup_once(&data)
+        .await
+        .expect("automatic ledger cleanup should succeed");
+
+    assert_eq!(summary.cost_reservations_deleted, 1);
+    assert_eq!(summary.request_admissions_deleted, 1);
+}
+
+#[tokio::test]
+async fn manual_usage_cleanup_does_not_collect_policy_ledgers() {
+    let repository = Arc::new(InMemorySettlementRepository::default());
+    repository
+        .reserve_usage_policy_request(ReserveUsagePolicyRequestInput {
+            request_id: "manual-request".to_string(),
+            subject_id: "user-1".to_string(),
+            event_token: "manual-event".to_string(),
+            admitted_at_unix_secs: 1,
+            retain_until_unix_secs: 2,
+            windows: vec![UsagePolicyRequestWindow {
+                starts_at_unix_secs: 0,
+                ends_at_unix_secs: 2,
+                limit_requests: 10,
+            }],
+        })
+        .await
+        .expect("request admission should be seeded");
+    let data = GatewayDataState::disabled().with_settlement_writer_for_tests(repository.clone());
+
+    let summary =
+        perform_manual_usage_cleanup_once(&data, super::ManualUsageCleanupOptions::policy())
+            .await
+            .expect("manual usage cleanup should succeed");
+
+    assert_eq!(summary.request_admissions_deleted, 0);
+    assert_eq!(
+        repository
+            .cleanup_usage_policy_request_admissions(u64::MAX, 10)
+            .await
+            .expect("direct cleanup should find the retained admission"),
+        1
+    );
 }
 
 #[tokio::test]

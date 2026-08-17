@@ -102,7 +102,7 @@ fn plan_has_package_rights(record: &BillingPlanRecord) -> bool {
         items.iter().any(|item| {
             matches!(
                 item.get("type").and_then(|value| value.as_str()),
-                Some("daily_quota" | "membership_group")
+                Some("daily_quota" | "membership_group" | "usage_policy")
             )
         })
     })

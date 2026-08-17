@@ -11,6 +11,7 @@ use crate::constants::*;
 use crate::control::GatewayControlDecision;
 use crate::control::GatewayLocalAuthRejection;
 use crate::headers::should_skip_response_header;
+use crate::plan_usage_policy::PlanUsagePolicyRejection;
 use crate::rate_limit::FrontdoorUserRpmRejection;
 use crate::{insert_header_if_missing, GatewayError};
 
@@ -258,6 +259,57 @@ pub(crate) fn build_local_user_rpm_limited_response(
     )
 }
 
+pub(crate) fn build_local_plan_usage_limited_response(
+    trace_id: &str,
+    control_decision: Option<&GatewayControlDecision>,
+    rejection: &PlanUsagePolicyRejection,
+) -> Result<Response<Body>, GatewayError> {
+    let message = "套餐使用限制已达到上限，请稍后重试";
+    let fallback_payload = json!({
+        "error": {
+            "type": "plan_usage_limit_exceeded",
+            "message": message,
+            "details": {
+                "metric": rejection.metric,
+                "window": rejection.window,
+                "limit": rejection.limit,
+                "retry_after": rejection.retry_after,
+            }
+        }
+    });
+    let payload = build_local_error_payload(
+        control_decision,
+        None,
+        message,
+        LocalCoreSyncErrorKind::RateLimit,
+        fallback_payload,
+    );
+    let body =
+        serde_json::to_vec(&payload).map_err(|err| GatewayError::Internal(err.to_string()))?;
+    let headers = BTreeMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("Retry-After".to_string(), rejection.retry_after.to_string()),
+        ("X-RateLimit-Limit".to_string(), rejection.limit.to_string()),
+        ("X-RateLimit-Remaining".to_string(), "0".to_string()),
+        ("X-RateLimit-Scope".to_string(), "plan".to_string()),
+        (
+            "X-RateLimit-Metric".to_string(),
+            rejection.metric.to_string(),
+        ),
+        (
+            "X-RateLimit-Window".to_string(),
+            rejection.window.to_string(),
+        ),
+    ]);
+    build_client_response_from_parts(
+        StatusCode::TOO_MANY_REQUESTS.as_u16(),
+        &headers,
+        Body::from(body),
+        trace_id,
+        control_decision,
+    )
+}
+
 pub(crate) fn build_local_http_error_response(
     trace_id: &str,
     control_decision: Option<&GatewayControlDecision>,
@@ -456,9 +508,10 @@ mod tests {
     use super::{
         build_client_response_from_parts, build_local_auth_rejection_response,
         build_local_http_error_response_with_request_path, build_local_overloaded_response,
-        build_local_user_rpm_limited_response,
+        build_local_plan_usage_limited_response, build_local_user_rpm_limited_response,
     };
     use crate::control::{GatewayControlDecision, GatewayLocalAuthRejection};
+    use crate::plan_usage_policy::PlanUsagePolicyRejection;
     use crate::rate_limit::FrontdoorUserRpmRejection;
     use axum::body::{to_bytes, Body};
     use std::collections::BTreeMap;
@@ -580,5 +633,26 @@ mod tests {
                 "path: {path}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn plan_usage_rejection_exposes_machine_readable_limit_headers() {
+        let response = build_local_plan_usage_limited_response(
+            "trace-plan-limit",
+            None,
+            &PlanUsagePolicyRejection {
+                metric: "request_count",
+                limit: 100.0,
+                retry_after: 42,
+                window: "calendar_week",
+            },
+        )
+        .expect("response");
+        assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["retry-after"], "42");
+        assert_eq!(response.headers()["x-ratelimit-scope"], "plan");
+        assert_eq!(response.headers()["x-ratelimit-window"], "calendar_week");
+        let payload = response_json(response).await;
+        assert_eq!(payload["error"]["type"], "plan_usage_limit_exceeded");
     }
 }

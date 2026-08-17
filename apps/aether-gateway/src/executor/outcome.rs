@@ -40,6 +40,12 @@ pub(crate) enum LocalExecutionRequestOutcome {
 pub(crate) struct DeferredUpstreamResponse;
 
 #[derive(Debug, Clone)]
+pub(crate) struct DeferredUsageContext {
+    plan: ExecutionPlan,
+    report_context: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct LocalExecutionExhaustion {
     request_id: String,
     data: UsageEventData,
@@ -80,6 +86,53 @@ impl LocalExecutionRequestOutcome {
 pub(crate) fn mark_deferred_upstream_response(mut response: Response<Body>) -> Response<Body> {
     response.extensions_mut().insert(DeferredUpstreamResponse);
     response
+}
+
+pub(crate) fn attach_deferred_usage_context(
+    response: &mut Response<Body>,
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+) {
+    response.extensions_mut().insert(DeferredUsageContext {
+        plan: plan.clone(),
+        report_context: report_context.cloned(),
+    });
+}
+
+pub(crate) fn record_failed_usage_for_deferred_response<'a>(
+    state: &'a AppState,
+    response: &Response<Body>,
+) -> impl std::future::Future<Output = ()> + Send + 'a {
+    let context = response.extensions().get::<DeferredUsageContext>().cloned();
+    let status_code = response.status().as_u16();
+    async move {
+        if !state.usage_runtime.is_enabled() {
+            return;
+        }
+        let Some(context) = context else {
+            return;
+        };
+        let mut data = build_usage_event_data_seed(&context.plan, context.report_context.as_ref());
+        data.status_code = Some(status_code);
+        data.error_message =
+            Some("all local candidates failed; returning preserved upstream error".to_string());
+        data.error_category = error_category_for_failed_status(status_code)
+            .or_else(|| Some("upstream_error".to_string()));
+        data.response_headers = Some(json_header_map());
+        data.client_response_headers = Some(json_header_map());
+
+        state
+            .usage_runtime
+            .record_terminal_event_direct(
+                state.usage_lifecycle_data_state().as_ref(),
+                UsageEvent::new(
+                    UsageEventType::Failed,
+                    context.plan.request_id.clone(),
+                    data,
+                ),
+            )
+            .await;
+    }
 }
 
 pub(crate) fn is_deferred_upstream_response(response: &Response<Body>) -> bool {

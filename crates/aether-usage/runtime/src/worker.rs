@@ -15,8 +15,9 @@ use crate::runtime::{
     UsageBillingEventEnricher, UsageRuntimeAccess, UsageWorkerRecordConcurrencyGate,
 };
 use crate::{
-    build_upsert_usage_record_from_event, settle_usage_if_needed, UsageEvent, UsageEventType,
-    UsageQueue, UsageRuntimeConfig, UsageSettlementWriter,
+    build_upsert_usage_record_from_event, reconcile_usage_policy_cost_for_event,
+    settle_usage_if_needed, UsageEvent, UsageEventType, UsageQueue, UsageRuntimeConfig,
+    UsageSettlementWriter,
 };
 
 const USAGE_WORKER_DB_PRESSURE_DEFER_MS: u64 = 10;
@@ -676,6 +677,7 @@ pub async fn write_event_record<T>(data: &T, event: &UsageEvent) -> Result<(), D
 where
     T: UsageRecordWriter + UsageSettlementWriter + Send + Sync,
 {
+    reconcile_usage_policy_cost_for_event(data, event).await?;
     let record = build_upsert_usage_record_from_event(event)?;
     if let Some(stored) = data.upsert_usage_record(record).await? {
         settle_usage_if_needed(data, &stored).await?;
@@ -728,7 +730,8 @@ mod tests {
     use std::time::Duration;
 
     use aether_data_contracts::repository::settlement::{
-        StoredUsageSettlement, UsageSettlementInput,
+        ReconcileUsagePolicyCostInput, StoredUsagePolicyCostReservation, StoredUsageSettlement,
+        UsageSettlementInput,
     };
     use aether_data_contracts::repository::usage::{StoredRequestUsageAudit, UpsertUsageRecord};
     use aether_data_contracts::DataLayerError;
@@ -755,6 +758,7 @@ mod tests {
     struct TestUsageStore {
         records: Mutex<Vec<UpsertUsageRecord>>,
         settlements: Mutex<Vec<UsageSettlementInput>>,
+        reconciliations: Mutex<Vec<ReconcileUsagePolicyCostInput>>,
         enrich_calls: Mutex<Vec<String>>,
         manual_proxy_counter_calls: AtomicUsize,
     }
@@ -958,6 +962,17 @@ mod tests {
             true
         }
 
+        async fn reconcile_usage_policy_cost(
+            &self,
+            input: ReconcileUsagePolicyCostInput,
+        ) -> Result<Option<StoredUsagePolicyCostReservation>, DataLayerError> {
+            self.reconciliations
+                .lock()
+                .expect("reconciliations lock")
+                .push(input);
+            Ok(None)
+        }
+
         async fn settle_usage(
             &self,
             input: UsageSettlementInput,
@@ -1145,6 +1160,39 @@ mod tests {
         let settlements = store.settlements.lock().expect("settlements lock");
         assert_eq!(settlements.len(), 1);
         assert_eq!(settlements[0].request_id, "req-worker-123");
+    }
+
+    #[tokio::test]
+    async fn same_request_id_terminal_events_reconcile_each_reservation_token_before_upsert() {
+        let store = TestUsageStore::default();
+        let mut first = sample_event();
+        first.request_id = "shared-client-trace".to_string();
+        first.data.actual_total_cost_usd = Some(0.25);
+        first.data.request_metadata = Some(serde_json::json!({
+            "plan_usage_reservation_token": "server-token-a"
+        }));
+        let mut second = first.clone();
+        second.data.actual_total_cost_usd = Some(0.75);
+        second.data.request_metadata = Some(serde_json::json!({
+            "plan_usage_reservation_token": "server-token-b"
+        }));
+
+        write_event_record(&store, &first)
+            .await
+            .expect("first terminal event");
+        write_event_record(&store, &second)
+            .await
+            .expect("second terminal event");
+
+        let reconciliations = store.reconciliations.lock().expect("reconciliations lock");
+        assert_eq!(reconciliations.len(), 2);
+        assert_eq!(reconciliations[0].request_id, "shared-client-trace");
+        assert_eq!(reconciliations[0].reservation_token, "server-token-a");
+        assert_eq!(reconciliations[0].actual_cost_units, 25_000_000);
+        assert_eq!(reconciliations[1].request_id, "shared-client-trace");
+        assert_eq!(reconciliations[1].reservation_token, "server-token-b");
+        assert_eq!(reconciliations[1].actual_cost_units, 75_000_000);
+        assert_eq!(store.records.lock().expect("records lock").len(), 2);
     }
 
     #[tokio::test]

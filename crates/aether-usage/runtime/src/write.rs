@@ -2129,6 +2129,12 @@ fn build_runtime_request_metadata_seed_from_parts(
             Value::String(websocket_transport),
         );
     }
+    if let Some(reservation_token) = context_string(context, "plan_usage_reservation_token") {
+        metadata.insert(
+            "plan_usage_reservation_token".to_string(),
+            Value::String(reservation_token),
+        );
+    }
     let provider_source_bytes = provider_request_body_base64.and_then(decoded_base64_len_hint);
     append_runtime_body_capture_metadata(
         &mut metadata,

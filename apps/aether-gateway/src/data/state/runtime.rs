@@ -16,24 +16,27 @@ use super::{
     DisableAdminRedeemCodeBatchInput, DisableAdminRedeemCodeInput, FailAdminWalletRefundInput,
     GatewayDataState, GatewayProviderTransportSnapshot, LocalVideoTaskReadResponse,
     PaymentGatewayConfigRecord, PaymentGatewayConfigWriteInput, ProcessAdminWalletRefundInput,
-    ProcessPaymentCallbackInput, ProcessPaymentCallbackOutcome, RedeemWalletCodeInput,
-    RedeemWalletCodeOutcome, RequestAuditBundle, RequestCandidateTrace, StoredAdminAuditLogPage,
-    StoredAdminPaymentCallbackPage, StoredAdminPaymentOrder, StoredAdminPaymentOrderPage,
-    StoredAdminRedeemCodeBatch, StoredAdminRedeemCodeBatchPage, StoredAdminRedeemCodePage,
-    StoredAdminWalletLedgerPage, StoredAdminWalletListPage, StoredAdminWalletRefund,
-    StoredAdminWalletRefundPage, StoredAdminWalletRefundRequestPage, StoredAdminWalletTransaction,
+    ProcessPaymentCallbackInput, ProcessPaymentCallbackOutcome, ReconcileUsagePolicyCostInput,
+    RedeemWalletCodeInput, RedeemWalletCodeOutcome, ReleaseUsagePolicyRequestAdmissionInput,
+    RequestAuditBundle, RequestCandidateTrace, ReserveUsagePolicyCostInput,
+    ReserveUsagePolicyCostOutcome, ReserveUsagePolicyRequestInput,
+    ReserveUsagePolicyRequestOutcome, StoredAdminAuditLogPage, StoredAdminPaymentCallbackPage,
+    StoredAdminPaymentOrder, StoredAdminPaymentOrderPage, StoredAdminRedeemCodeBatch,
+    StoredAdminRedeemCodeBatchPage, StoredAdminRedeemCodePage, StoredAdminWalletLedgerPage,
+    StoredAdminWalletListPage, StoredAdminWalletRefund, StoredAdminWalletRefundPage,
+    StoredAdminWalletRefundRequestPage, StoredAdminWalletTransaction,
     StoredAdminWalletTransactionPage, StoredAnnouncement, StoredAnnouncementPage,
     StoredBackgroundTaskEvent, StoredBackgroundTaskRun, StoredBackgroundTaskRunPage,
     StoredBillingModelContext, StoredProviderQuotaSnapshot, StoredProviderUsageSummary,
-    StoredRequestUsageAudit, StoredSuspiciousActivity, StoredUsageSettlement,
-    StoredUserAuditLogPage, StoredUserAuthRecord, StoredUserExportRow, StoredUserSummary,
-    StoredVideoTask, StoredWalletDailyUsageLedger, StoredWalletDailyUsageLedgerPage,
-    StoredWalletSnapshot, UpdateAnnouncementRecord, UpsertBackgroundTaskEvent,
-    UpsertBackgroundTaskRun, UpsertUsageRecord, UpsertVideoTask, UsageSettlementInput,
-    UserDailyQuotaAvailabilityRecord, UserPlanEntitlementRecord, VideoTaskLookupKey,
-    VideoTaskModelCount, VideoTaskQueryFilter, VideoTaskStatusCount,
-    WalletDailyUsageAggregationInput, WalletDailyUsageAggregationResult, WalletLookupKey,
-    WalletMutationOutcome,
+    StoredRequestUsageAudit, StoredSuspiciousActivity, StoredUsagePolicyCostReservation,
+    StoredUsagePolicyRequestAdmission, StoredUsageSettlement, StoredUserAuditLogPage,
+    StoredUserAuthRecord, StoredUserExportRow, StoredUserSummary, StoredVideoTask,
+    StoredWalletDailyUsageLedger, StoredWalletDailyUsageLedgerPage, StoredWalletSnapshot,
+    UpdateAnnouncementRecord, UpsertBackgroundTaskEvent, UpsertBackgroundTaskRun,
+    UpsertUsageRecord, UpsertVideoTask, UsageSettlementInput, UserDailyQuotaAvailabilityRecord,
+    UserPlanEntitlementRecord, VideoTaskLookupKey, VideoTaskModelCount, VideoTaskQueryFilter,
+    VideoTaskStatusCount, WalletDailyUsageAggregationInput, WalletDailyUsageAggregationResult,
+    WalletLookupKey, WalletMutationOutcome,
 };
 use aether_data_contracts::repository::usage::{
     PendingUsageCleanupSummary, ProviderApiKeyWindowUsageRequest,
@@ -1148,6 +1151,83 @@ impl GatewayDataState {
         match &self.settlement_writer {
             Some(repository) => repository.settle_usage(input).await,
             None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn reserve_usage_policy_cost(
+        &self,
+        input: ReserveUsagePolicyCostInput,
+    ) -> Result<Option<ReserveUsagePolicyCostOutcome>, DataLayerError> {
+        match &self.settlement_writer {
+            Some(repository) => repository.reserve_usage_policy_cost(input).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn reserve_usage_policy_request(
+        &self,
+        input: ReserveUsagePolicyRequestInput,
+    ) -> Result<Option<ReserveUsagePolicyRequestOutcome>, DataLayerError> {
+        match &self.settlement_writer {
+            Some(repository) => repository
+                .reserve_usage_policy_request(input)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn release_usage_policy_request_admission(
+        &self,
+        input: ReleaseUsagePolicyRequestAdmissionInput,
+    ) -> Result<Option<StoredUsagePolicyRequestAdmission>, DataLayerError> {
+        match &self.settlement_writer {
+            Some(repository) => {
+                repository
+                    .release_usage_policy_request_admission(input)
+                    .await
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn cleanup_usage_policy_request_admissions(
+        &self,
+        now_unix_secs: u64,
+        batch_size: usize,
+    ) -> Result<usize, DataLayerError> {
+        match &self.settlement_writer {
+            Some(repository) => {
+                repository
+                    .cleanup_usage_policy_request_admissions(now_unix_secs, batch_size)
+                    .await
+            }
+            None => Ok(0),
+        }
+    }
+
+    pub(crate) async fn reconcile_usage_policy_cost(
+        &self,
+        input: ReconcileUsagePolicyCostInput,
+    ) -> Result<Option<StoredUsagePolicyCostReservation>, DataLayerError> {
+        match &self.settlement_writer {
+            Some(repository) => repository.reconcile_usage_policy_cost(input).await,
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn cleanup_usage_policy_cost_reservations(
+        &self,
+        now_unix_secs: u64,
+        batch_size: usize,
+    ) -> Result<usize, DataLayerError> {
+        match &self.settlement_writer {
+            Some(repository) => {
+                repository
+                    .cleanup_usage_policy_cost_reservations(now_unix_secs, batch_size)
+                    .await
+            }
+            None => Ok(0),
         }
     }
 

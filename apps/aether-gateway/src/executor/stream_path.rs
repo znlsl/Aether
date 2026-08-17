@@ -101,7 +101,7 @@ pub(crate) async fn maybe_execute_via_stream_decision_path(
     if skip_direct_plan {
         return Ok(LocalExecutionRequestOutcome::NoPath);
     }
-    let transfer_tracker = ProviderTransferTracker::default();
+    let transfer_tracker = ProviderTransferTracker::for_request(parts);
 
     if plan_kind == OPENAI_CHAT_STREAM_PLAN_KIND
         && supports_stream_execution_decision_kind(plan_kind)

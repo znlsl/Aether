@@ -4,6 +4,9 @@ use futures_util::{stream::TryStream, TryStreamExt};
 use sqlx::{postgres::PgRow, PgPool, Row};
 use uuid::Uuid;
 
+use aether_data_contracts::repository::billing::{
+    entitlements_have_replacement_selector, entitlements_should_replace_existing,
+};
 use aether_data_contracts::repository::wallet::{
     redeem_code_credits_recharge_balance, redeem_code_payment_method,
     redeem_code_refundable_amount, AdjustWalletBalanceInput, AdminPaymentOrderListQuery,
@@ -5550,34 +5553,14 @@ fn plan_purchase_limit_scope(snapshot: &serde_json::Value) -> &str {
     }
 }
 
-fn plan_replacement_entitlement_types(snapshot: &serde_json::Value) -> Vec<&'static str> {
-    let entitlements = plan_entitlements_snapshot(snapshot);
-    let mut kinds = Vec::new();
-    if entitlement_snapshot_has_type(&entitlements, "daily_quota") {
-        kinds.push("daily_quota");
-    }
-    if entitlement_snapshot_has_type(&entitlements, "membership_group") {
-        kinds.push("membership_group");
-    }
-    kinds
-}
-
-fn entitlement_snapshot_has_type(snapshot: &serde_json::Value, entitlement_type: &str) -> bool {
-    snapshot.as_array().is_some_and(|items| {
-        items
-            .iter()
-            .any(|item| item.get("type").and_then(|value| value.as_str()) == Some(entitlement_type))
-    })
-}
-
 async fn replace_matching_plan_entitlements_postgres(
     tx: &mut crate::PostgresTransaction,
     user_id: &str,
     snapshot: &serde_json::Value,
     now: chrono::DateTime<Utc>,
 ) -> Result<(), DataLayerError> {
-    let replacement_types = plan_replacement_entitlement_types(snapshot);
-    if replacement_types.is_empty() {
+    let incoming_entitlements = plan_entitlements_snapshot(snapshot);
+    if !entitlements_have_replacement_selector(&incoming_entitlements) {
         return Ok(());
     }
 
@@ -5598,9 +5581,8 @@ WHERE user_id = $1
 
     for row in rows {
         let entitlements: serde_json::Value = row_get(&row, "entitlements_snapshot")?;
-        let should_replace = replacement_types
-            .iter()
-            .any(|kind| entitlement_snapshot_has_type(&entitlements, kind));
+        let should_replace =
+            entitlements_should_replace_existing(&incoming_entitlements, &entitlements);
         if !should_replace {
             continue;
         }

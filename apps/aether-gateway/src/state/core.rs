@@ -354,6 +354,7 @@ impl AppState {
             auth_api_key_force_capabilities_cache: Arc::new(JsonValueCache::default()),
             auth_api_key_feature_settings_cache: Arc::new(JsonValueCache::default()),
             auth_daily_quota_availability_cache: Arc::new(ValueCache::default()),
+            auth_plan_usage_policy_cache: Arc::new(ValueCache::default()),
             auth_wallet_snapshot_cache: Arc::new(ValueCache::default()),
             auth_request_cost_upper_bound_cache: Arc::new(ValueCache::default()),
             provider_quota_snapshot_cache: Arc::new(ValueCache::default()),
@@ -950,6 +951,7 @@ impl AppState {
         self.auth_api_key_force_capabilities_cache.clear();
         self.auth_api_key_feature_settings_cache.clear();
         self.auth_daily_quota_availability_cache.clear();
+        self.auth_plan_usage_policy_cache.clear();
         self.auth_wallet_snapshot_cache.clear();
         self.auth_request_cost_upper_bound_cache.clear();
         self.provider_quota_snapshot_cache.clear();

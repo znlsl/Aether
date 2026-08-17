@@ -813,11 +813,11 @@ pub(super) async fn submit_midstream_stream_failure(
     started_at_unix_ms: u64,
     failure: StreamFailureReport,
 ) {
-    let Some(report_kind) =
-        direct_stream_finalize_kind.and_then(resolve_core_error_background_report_kind)
-    else {
-        return;
-    };
+    let background_report_kind =
+        direct_stream_finalize_kind.and_then(resolve_core_error_background_report_kind);
+    let submit_background_report = background_report_kind.is_some();
+    let report_kind =
+        background_report_kind.unwrap_or_else(|| "execution_runtime_stream_error".to_string());
 
     let candidate_status_code = failure.upstream_status_code;
     let payload = build_stream_failure_sync_payload(
@@ -839,6 +839,9 @@ pub(super) async fn submit_midstream_stream_failure(
         StreamFailureHandling::Terminal,
     )
     .await;
+    if !submit_background_report {
+        return;
+    }
     if let Err(err) = submit_sync_report(state, payload).await {
         let request_id = short_request_id(plan.request_id.as_str());
         warn!(

@@ -477,6 +477,8 @@ impl SqlxUsageReadRepository {
                 header_cleaned: 0,
                 keys_cleaned: 0,
                 records_deleted: 0,
+                cost_reservations_deleted: 0,
+                request_admissions_deleted: 0,
             });
         }
 
@@ -549,6 +551,8 @@ impl SqlxUsageReadRepository {
             header_cleaned,
             keys_cleaned,
             records_deleted,
+            cost_reservations_deleted: 0,
+            request_admissions_deleted: 0,
         })
     }
 }

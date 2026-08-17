@@ -397,6 +397,8 @@ pub struct AppState {
     pub(crate) auth_api_key_feature_settings_cache: Arc<JsonValueCache<AuthApiKeyFeatureCacheKey>>,
     pub(crate) auth_daily_quota_availability_cache:
         Arc<ValueCache<String, UserDailyQuotaAvailabilityRecord>>,
+    pub(crate) auth_plan_usage_policy_cache:
+        Arc<ValueCache<String, crate::plan_usage_policy::EffectivePlanUsagePolicy>>,
     pub(crate) auth_wallet_snapshot_cache:
         Arc<ValueCache<String, aether_data::repository::wallet::StoredWalletSnapshot>>,
     pub(crate) auth_request_cost_upper_bound_cache: Arc<ValueCache<String, f64>>,

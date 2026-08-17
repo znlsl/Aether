@@ -132,6 +132,7 @@ pub(crate) fn retain_first_byte_request_metadata(value: Option<Value>) -> Option
                 | "upstream_is_stream"
                 | "client_session_affinity"
                 | "api_key_is_standalone"
+                | "plan_usage_reservation_token"
                 | "request_path"
                 | "request_query_string"
                 | "request_path_and_query"
@@ -351,6 +352,7 @@ fn copy_allowed_metadata_fields(source: &Map<String, Value>, target: &mut Map<St
     copy_bool(source, target, "api_key_is_standalone");
     copy_bool(source, target, WEBSOCKET_MODE_METADATA_KEY);
     copy_non_empty_string(source, target, WEBSOCKET_TRANSPORT_METADATA_KEY);
+    copy_non_empty_string(source, target, "plan_usage_reservation_token");
     copy_non_empty_string(source, target, "request_path");
     copy_non_empty_string(source, target, "request_query_string");
     copy_non_empty_string(source, target, "request_path_and_query");
@@ -407,6 +409,7 @@ fn move_allowed_metadata_fields(mut source: Map<String, Value>, target: &mut Map
     remove_bool(&mut source, target, "api_key_is_standalone");
     remove_bool(&mut source, target, WEBSOCKET_MODE_METADATA_KEY);
     remove_non_empty_string(&mut source, target, WEBSOCKET_TRANSPORT_METADATA_KEY);
+    remove_non_empty_string(&mut source, target, "plan_usage_reservation_token");
     remove_non_empty_string(&mut source, target, "request_path");
     remove_non_empty_string(&mut source, target, "request_query_string");
     remove_non_empty_string(&mut source, target, "request_path_and_query");

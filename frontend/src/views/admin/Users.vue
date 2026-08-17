@@ -245,6 +245,11 @@ import {
 } from '@/features/users/components/user-management-config'
 import WalletOpsDrawer from '@/features/wallet/components/WalletOpsDrawer.vue'
 import { parseApiError } from '@/utils/errorParser'
+import {
+  entitlementsWillReplaceExisting,
+  isPlanEntitlementReplacementCandidate,
+  usagePolicyEntitlementLabels,
+} from '@/utils/billingEntitlements'
 import { formatTokens, formatRateLimitInheritable, formatRateLimitSimple, isRateLimitInherited, isRateLimitUnlimited } from '@/utils/format'
 import { log } from '@/utils/logger'
 import { useBatchSelection } from '@/composables/useBatchSelection'
@@ -555,7 +560,7 @@ function formatPlanDuration(plan: BillingPlan): string {
 }
 
 function entitlementLabels(items: BillingEntitlement[] | undefined): string[] {
-  return (items || []).map((item) => {
+  return (items || []).flatMap((item) => {
     if (item.type === 'wallet_credit') {
       return `${legacyT('附赠余额')} $${Number(item.amount_usd || 0).toFixed(2)}`
     }
@@ -565,12 +570,19 @@ function entitlementLabels(items: BillingEntitlement[] | undefined): string[] {
     if (item.type === 'membership_group') {
       return legacyT('会员权益')
     }
+    if (item.type === 'usage_policy') {
+      return usagePolicyEntitlementLabels(item)
+    }
     return item.type
   })
 }
 
 function hasPackageEntitlement(items: BillingEntitlement[] | undefined): boolean {
-  return (items || []).some((item) => item.type === 'daily_quota' || item.type === 'membership_group')
+  return (items || []).some((item) =>
+    item.type === 'daily_quota'
+    || item.type === 'membership_group'
+    || item.type === 'usage_policy'
+  )
 }
 
 async function loadUserWallets(options: { cacheTtlMs?: number } = {}) {
@@ -865,6 +877,21 @@ async function loadAvailableBillingPlans() {
 
 async function grantPlanToSelectedUser() {
   if (!selectedUser.value || !selectedGrantPlanId.value) return
+  const selectedPlan = availableBillingPlans.value.find(
+    plan => plan.id === selectedGrantPlanId.value,
+  )
+  const replacesExisting = selectedPlan && userPlanEntitlements.value.some(item =>
+    isPlanEntitlementReplacementCandidate(item)
+    && entitlementsWillReplaceExisting(selectedPlan.entitlements, item.entitlements)
+  )
+  if (replacesExisting) {
+    const confirmed = await confirmDanger(
+      legacyT('发放成功后，冲突的旧套餐及其组合权益会整包失效。确定继续发放吗？'),
+      legacyT('确认替换旧套餐'),
+      legacyT('继续发放'),
+    )
+    if (!confirmed) return
+  }
   grantingUserPlan.value = true
   try {
     const response = await usersApi.grantUserPlan(selectedUser.value.id, {

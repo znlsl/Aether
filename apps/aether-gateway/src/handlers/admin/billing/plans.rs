@@ -4,7 +4,10 @@ use super::{
 };
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::{GatewayError, LocalMutationOutcome};
-use aether_data_contracts::repository::billing::{BillingPlanRecord, BillingPlanWriteInput};
+use aether_data_contracts::repository::billing::{
+    parse_usage_policy_entitlements, validate_entitlement_replacement_groups, BillingPlanRecord,
+    BillingPlanWriteInput,
+};
 use axum::{
     body::{Body, Bytes},
     http,
@@ -172,11 +175,16 @@ fn validate_entitlements(value: &serde_json::Value) -> Result<(), String> {
                     }
                 }
             }
+            "usage_policy" => {}
             _ => return Err(format!("unsupported entitlement type: {kind}")),
         }
     }
+    validate_entitlement_replacement_groups(value).map_err(|error| error.to_string())?;
+    parse_usage_policy_entitlements(value).map_err(|error| error.to_string())?;
     if !entitlements_include_package_rights(items) {
-        return Err("套餐至少需要包含每日额度或会员分组；钱包充值请使用充值功能".to_string());
+        return Err(
+            "套餐至少需要包含每日额度、会员分组或使用限制；钱包充值请使用充值功能".to_string(),
+        );
     }
     Ok(())
 }
@@ -185,7 +193,7 @@ fn entitlements_include_package_rights(items: &[serde_json::Value]) -> bool {
     items.iter().any(|item| {
         matches!(
             item.get("type").and_then(|value| value.as_str()),
-            Some("daily_quota" | "membership_group")
+            Some("daily_quota" | "membership_group" | "usage_policy")
         )
     })
 }

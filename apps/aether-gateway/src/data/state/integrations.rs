@@ -11,7 +11,10 @@ use aether_data_contracts::repository::candidates::DecisionTrace;
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
-use aether_data_contracts::repository::settlement::{StoredUsageSettlement, UsageSettlementInput};
+use aether_data_contracts::repository::settlement::{
+    ReconcileUsagePolicyCostInput, StoredUsagePolicyCostReservation, StoredUsageSettlement,
+    UsageSettlementInput,
+};
 use aether_data_contracts::repository::usage::{
     ProxyNodeCounterDelta, StoredRequestUsageAudit, UpsertUsageRecord, UsageWriteRepository,
 };
@@ -217,6 +220,13 @@ impl BillingModelContextLookup for GatewayDataState {
 impl UsageSettlementWriter for GatewayDataState {
     fn has_usage_settlement_writer(&self) -> bool {
         GatewayDataState::has_settlement_writer(self)
+    }
+
+    async fn reconcile_usage_policy_cost(
+        &self,
+        input: ReconcileUsagePolicyCostInput,
+    ) -> Result<Option<StoredUsagePolicyCostReservation>, DataLayerError> {
+        GatewayDataState::reconcile_usage_policy_cost(self, input).await
     }
 
     async fn settle_usage(

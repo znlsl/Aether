@@ -20,7 +20,8 @@ use crate::ai_serving::api::{
 use crate::api::response::{
     build_client_response, build_client_response_from_parts, build_local_auth_rejection_response,
     build_local_http_error_response, build_local_http_error_response_with_request_path,
-    build_local_overloaded_response, build_local_user_rpm_limited_response,
+    build_local_overloaded_response, build_local_plan_usage_limited_response,
+    build_local_user_rpm_limited_response,
 };
 use crate::constants::{
     CONTROL_CANDIDATE_ID_HEADER, DEPENDENCY_REASON_HEADER, EXECUTION_PATH_CONTROL_EXECUTE_STREAM,
@@ -1432,6 +1433,8 @@ async fn proxy_request_inner(
         None
     };
 
+    // The first gateway forwards before plan admission. The owner sees the loop guard above,
+    // skips forwarding, and performs admission exactly once before local execution.
     let owner_forward_started_at = Instant::now();
     let owner_forward_response = maybe_forward_public_request_to_tunnel_owner(
         &state,
@@ -1567,6 +1570,98 @@ async fn proxy_request_inner(
         ));
     }
 
+    let plan_usage_started_at = Instant::now();
+    let plan_usage_event_id = uuid::Uuid::new_v4().to_string();
+    let now_unix_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    parts
+        .extensions
+        .insert(crate::plan_usage_policy::PlanUsageReservationContext::new(
+            plan_usage_event_id.clone(),
+            now_unix_ms / 1_000,
+        ));
+    let plan_usage_permit = match crate::plan_usage_policy::check_and_acquire_plan_usage_policy(
+        &state,
+        control_decision,
+        &plan_usage_event_id,
+        now_unix_ms,
+    )
+    .await
+    {
+        Ok(permit) => permit,
+        Err(crate::plan_usage_policy::PlanUsageAdmissionError::Rejected(rejection)) => {
+            let response =
+                build_local_plan_usage_limited_response(&trace_id, control_decision, &rejection)?;
+            return Ok(finalize_gateway_response_with_context(
+                &state,
+                response,
+                &remote_addr,
+                &request_context,
+                EXECUTION_PATH_LOCAL_RATE_LIMITED,
+                &started_at,
+                request_permit.take(),
+            ));
+        }
+        Err(crate::plan_usage_policy::PlanUsageAdmissionError::Runtime(
+            aether_runtime_state::RuntimeSemaphoreError::Saturated { limit, .. },
+        )) => {
+            let rejection = crate::plan_usage_policy::PlanUsagePolicyRejection {
+                metric: "concurrency",
+                limit: limit as f64,
+                retry_after: 1,
+                window: "concurrent",
+            };
+            let response =
+                build_local_plan_usage_limited_response(&trace_id, control_decision, &rejection)?;
+            return Ok(finalize_gateway_response_with_context(
+                &state,
+                response,
+                &remote_addr,
+                &request_context,
+                EXECUTION_PATH_LOCAL_RATE_LIMITED,
+                &started_at,
+                request_permit.take(),
+            ));
+        }
+        Err(crate::plan_usage_policy::PlanUsageAdmissionError::Runtime(
+            aether_runtime_state::RuntimeSemaphoreError::Unavailable { gate, limit, .. },
+        )) => {
+            let response = build_local_overloaded_response(
+                &trace_id,
+                control_decision,
+                Some(request_context.request_path.as_str()),
+                gate,
+                limit,
+            )?;
+            return Ok(finalize_gateway_response_with_context(
+                &state,
+                response,
+                &remote_addr,
+                &request_context,
+                EXECUTION_PATH_DISTRIBUTED_OVERLOADED,
+                &started_at,
+                request_permit.take(),
+            ));
+        }
+        Err(crate::plan_usage_policy::PlanUsageAdmissionError::Runtime(
+            aether_runtime_state::RuntimeSemaphoreError::InvalidConfiguration(message),
+        )) => return Err(GatewayError::Internal(message)),
+        Err(crate::plan_usage_policy::PlanUsageAdmissionError::Gateway(error)) => {
+            return Err(error)
+        }
+    };
+    observe_gateway_stage_ms(
+        "frontdoor_plan_usage",
+        plan_usage_started_at.elapsed().as_millis() as u64,
+    );
+    request_permit = aether_runtime::AdmissionPermit::combine(
+        request_permit.into_iter().chain(plan_usage_permit),
+    );
+    if let Some(request_permit) = request_permit.as_ref() {
+        parts.extensions.insert(
+            crate::executor::candidate_loop::BackgroundAdmissionPermit::new(request_permit.clone()),
+        );
+    }
+
     let local_ai_public_started_at = Instant::now();
     let local_ai_public_response = super::public::maybe_build_local_ai_public_response(
         &state,
@@ -1671,6 +1766,11 @@ async fn proxy_request_inner(
             );
             match stream_outcome {
                 LocalExecutionRequestOutcome::Responded(execution_runtime_response) => {
+                    crate::executor::record_failed_usage_for_deferred_response(
+                        &state,
+                        &execution_runtime_response,
+                    )
+                    .await;
                     let execution_runtime_response = restore_redacted_stream_execution_response(
                         execution_runtime_response,
                         &redaction_slot,
@@ -1730,6 +1830,11 @@ async fn proxy_request_inner(
         );
         match sync_outcome {
             LocalExecutionRequestOutcome::Responded(execution_runtime_response) => {
+                crate::executor::record_failed_usage_for_deferred_response(
+                    &state,
+                    &execution_runtime_response,
+                )
+                .await;
                 let execution_runtime_response = restore_redacted_sync_execution_response(
                     execution_runtime_response,
                     &redaction_slot,
@@ -1791,6 +1896,11 @@ async fn proxy_request_inner(
             );
             match stream_outcome {
                 LocalExecutionRequestOutcome::Responded(execution_runtime_response) => {
+                    crate::executor::record_failed_usage_for_deferred_response(
+                        &state,
+                        &execution_runtime_response,
+                    )
+                    .await;
                     let execution_runtime_response = restore_redacted_stream_execution_response(
                         execution_runtime_response,
                         &redaction_slot,
@@ -1824,6 +1934,11 @@ async fn proxy_request_inner(
             .await?
             {
                 LocalExecutionRequestOutcome::Responded(control_response) => {
+                    crate::executor::record_failed_usage_for_deferred_response(
+                        &state,
+                        &control_response,
+                    )
+                    .await;
                     let reason = GatewayFallbackReason::ControlExecuteEmergency;
                     let control_execution_path = if stream_request {
                         EXECUTION_PATH_CONTROL_EXECUTE_STREAM

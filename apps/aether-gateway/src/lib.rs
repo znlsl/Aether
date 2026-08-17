@@ -58,6 +58,7 @@ pub(crate) mod middleware;
 mod model_fetch;
 mod oauth;
 mod orchestration;
+mod plan_usage_policy;
 mod privacy;
 mod process_metrics;
 mod provider_key_auth;

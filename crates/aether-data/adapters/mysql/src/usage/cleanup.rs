@@ -291,6 +291,8 @@ pub(crate) async fn cleanup_usage(
         header_cleaned,
         keys_cleaned,
         records_deleted,
+        cost_reservations_deleted: 0,
+        request_admissions_deleted: 0,
     })
 }
 

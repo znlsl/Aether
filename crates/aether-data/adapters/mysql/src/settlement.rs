@@ -1,10 +1,14 @@
 use async_trait::async_trait;
-use sqlx::{mysql::MySqlRow, Row};
+use sqlx::{mysql::MySqlRow, Acquire, Row};
 
 use aether_data_contracts::repository::settlement::{
     finite_wallet_available_usd, plan_finite_wallet_debit, settlement_billable_cost_usd,
-    settlement_billing_status_for_usage_status, SettlementWriteRepository, StoredUsageSettlement,
-    UsageSettlementInput, SETTLEMENT_EPSILON_USD,
+    settlement_billing_status_for_usage_status, ReconcileUsagePolicyCostInput,
+    ReleaseUsagePolicyRequestAdmissionInput, ReserveUsagePolicyCostInput,
+    ReserveUsagePolicyCostOutcome, ReserveUsagePolicyRequestInput,
+    ReserveUsagePolicyRequestOutcome, SettlementWriteRepository, StoredUsagePolicyCostReservation,
+    StoredUsagePolicyRequestAdmission, StoredUsageSettlement, UsagePolicyCostReservationState,
+    UsagePolicyRequestAdmissionState, UsageSettlementInput, SETTLEMENT_EPSILON_USD,
 };
 use aether_data_contracts::DataLayerError;
 
@@ -110,6 +114,143 @@ impl MysqlSettlementRepository {
     pub fn new(pool: MysqlPool) -> Self {
         Self { pool }
     }
+}
+
+fn usage_policy_cost_i64(value: u64, field: &str) -> Result<i64, DataLayerError> {
+    i64::try_from(value)
+        .map_err(|_| DataLayerError::InvalidInput(format!("{field} exceeds the integer range")))
+}
+
+fn usage_policy_cost_u64(value: i64, field: &str) -> Result<u64, DataLayerError> {
+    u64::try_from(value)
+        .map_err(|_| DataLayerError::UnexpectedValue(format!("{field} must not be negative")))
+}
+
+fn usage_policy_request_admission_from_mysql_row(
+    row: &MySqlRow,
+) -> Result<StoredUsagePolicyRequestAdmission, DataLayerError> {
+    let state: String = row.try_get("state").map_sql_err()?;
+    Ok(StoredUsagePolicyRequestAdmission {
+        request_id: row.try_get("request_id").map_sql_err()?,
+        subject_id: row.try_get("subject_id").map_sql_err()?,
+        event_token: row.try_get("event_token").map_sql_err()?,
+        admitted_at_unix_secs: usage_policy_cost_u64(
+            row.try_get("admitted_at_unix_secs").map_sql_err()?,
+            "usage policy request admitted_at",
+        )?,
+        retain_until_unix_secs: usage_policy_cost_u64(
+            row.try_get("retain_until_unix_secs").map_sql_err()?,
+            "usage policy request retain_until",
+        )?,
+        state: UsagePolicyRequestAdmissionState::parse(&state).ok_or_else(|| {
+            DataLayerError::UnexpectedValue(format!(
+                "unknown usage policy request admission state {state}"
+            ))
+        })?,
+        released_at_unix_secs: row
+            .try_get::<Option<i64>, _>("released_at_unix_secs")
+            .map_sql_err()?
+            .map(|value| usage_policy_cost_u64(value, "usage policy request released_at"))
+            .transpose()?,
+    })
+}
+
+const FIND_USAGE_POLICY_REQUEST_ADMISSION_MYSQL_SQL: &str = r#"
+SELECT request_id, subject_id, event_token,
+       admitted_at AS admitted_at_unix_secs,
+       retain_until AS retain_until_unix_secs,
+       state, released_at AS released_at_unix_secs
+FROM usage_request_admissions
+WHERE event_token = ?
+FOR UPDATE
+"#;
+
+const USAGE_POLICY_REQUEST_TRANSACTION_ISOLATION_MYSQL_SQL: &str =
+    "SET TRANSACTION ISOLATION LEVEL READ COMMITTED";
+
+fn usage_policy_cost_reservation_from_mysql_row(
+    row: &MySqlRow,
+) -> Result<StoredUsagePolicyCostReservation, DataLayerError> {
+    let state: String = row.try_get("state").map_sql_err()?;
+    Ok(StoredUsagePolicyCostReservation {
+        request_id: row.try_get("request_id").map_sql_err()?,
+        subject_id: row.try_get("subject_id").map_sql_err()?,
+        reservation_token: row.try_get("reservation_token").map_sql_err()?,
+        admitted_at_unix_secs: usage_policy_cost_u64(
+            row.try_get("admitted_at_unix_secs").map_sql_err()?,
+            "usage policy admitted_at",
+        )?,
+        reserved_cost_units: usage_policy_cost_u64(
+            row.try_get("reserved_cost_units").map_sql_err()?,
+            "usage policy reserved_cost_units",
+        )?,
+        actual_cost_units: row
+            .try_get::<Option<i64>, _>("actual_cost_units")
+            .map_sql_err()?
+            .map(|value| usage_policy_cost_u64(value, "usage policy actual_cost_units"))
+            .transpose()?,
+        state: UsagePolicyCostReservationState::parse(&state).ok_or_else(|| {
+            DataLayerError::UnexpectedValue(format!(
+                "unknown usage policy reservation state {state}"
+            ))
+        })?,
+        reservation_expires_at_unix_secs: usage_policy_cost_u64(
+            row.try_get("reservation_expires_at_unix_secs")
+                .map_sql_err()?,
+            "usage policy reservation_expires_at",
+        )?,
+        retain_until_unix_secs: usage_policy_cost_u64(
+            row.try_get("retain_until_unix_secs").map_sql_err()?,
+            "usage policy retain_until",
+        )?,
+        finalized_at_unix_secs: row
+            .try_get::<Option<i64>, _>("finalized_at_unix_secs")
+            .map_sql_err()?
+            .map(|value| usage_policy_cost_u64(value, "usage policy finalized_at"))
+            .transpose()?,
+    })
+}
+
+const FIND_USAGE_POLICY_COST_RESERVATION_MYSQL_SQL: &str = r#"
+SELECT
+  request_id,
+  subject_id,
+  reservation_token,
+  admitted_at AS admitted_at_unix_secs,
+  reserved_cost_units,
+  actual_cost_units,
+  state,
+  reservation_expires_at AS reservation_expires_at_unix_secs,
+  retain_until AS retain_until_unix_secs,
+  finalized_at AS finalized_at_unix_secs
+FROM usage_cost_reservations
+WHERE reservation_token = ?
+FOR UPDATE
+"#;
+
+async fn lock_usage_policy_subject_mysql(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    subject_id: &str,
+) -> Result<(), DataLayerError> {
+    let exists = sqlx::query_scalar::<_, String>(
+        r#"
+SELECT id
+FROM users
+WHERE id = ?
+FOR UPDATE
+        "#,
+    )
+    .bind(subject_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_sql_err()?
+    .is_some();
+    if !exists {
+        return Err(DataLayerError::InvalidInput(
+            "usage policy subject does not exist".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn settlement_from_row(row: &MySqlRow) -> Result<StoredUsageSettlement, DataLayerError> {
@@ -370,6 +511,466 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 
 #[async_trait]
 impl SettlementWriteRepository for MysqlSettlementRepository {
+    async fn reserve_usage_policy_request(
+        &self,
+        input: ReserveUsagePolicyRequestInput,
+    ) -> Result<ReserveUsagePolicyRequestOutcome, DataLayerError> {
+        input.validate()?;
+        let admitted_at = usage_policy_cost_i64(
+            input.admitted_at_unix_secs,
+            "usage policy request admitted_at",
+        )?;
+        let retain_until = usage_policy_cost_i64(
+            input.retain_until_unix_secs,
+            "usage policy request retain_until",
+        )?;
+        let created_at = now_unix_secs()?;
+        // Different subjects lock different `users` rows. Under InnoDB's default REPEATABLE READ,
+        // two missing-token locking reads can retain compatible gap locks and then deadlock when
+        // both transactions try to insert the same unique event token. READ COMMITTED removes
+        // that gap-lock cycle while the subject row still serializes each subject's window count.
+        let mut connection = self.pool.acquire().await.map_sql_err()?;
+        sqlx::query(USAGE_POLICY_REQUEST_TRANSACTION_ISOLATION_MYSQL_SQL)
+            .execute(&mut *connection)
+            .await
+            .map_sql_err()?;
+        let mut tx = connection.begin().await.map_sql_err()?;
+        lock_usage_policy_subject_mysql(&mut tx, &input.subject_id).await?;
+
+        let existing_row = sqlx::query(FIND_USAGE_POLICY_REQUEST_ADMISSION_MYSQL_SQL)
+            .bind(&input.event_token)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_sql_err()?;
+        if let Some(row) = existing_row.as_ref() {
+            let existing = usage_policy_request_admission_from_mysql_row(row)?;
+            if existing.request_id != input.request_id || existing.subject_id != input.subject_id {
+                tx.commit().await.map_sql_err()?;
+                return Ok(ReserveUsagePolicyRequestOutcome::Conflict);
+            }
+            if existing.admitted_at_unix_secs != input.admitted_at_unix_secs {
+                return Err(DataLayerError::InvalidInput(
+                    "usage policy event_token must keep its original admitted_at".to_string(),
+                ));
+            }
+            sqlx::query(
+                "UPDATE usage_request_admissions SET retain_until = GREATEST(retain_until, ?) WHERE event_token = ?",
+            )
+            .bind(retain_until)
+            .bind(&input.event_token)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+            let outcome = match existing.state {
+                UsagePolicyRequestAdmissionState::Active => {
+                    ReserveUsagePolicyRequestOutcome::Allowed
+                }
+                UsagePolicyRequestAdmissionState::Released => {
+                    ReserveUsagePolicyRequestOutcome::AlreadyReleased
+                }
+            };
+            tx.commit().await.map_sql_err()?;
+            return Ok(outcome);
+        }
+
+        for (window_index, window) in input.windows.iter().enumerate() {
+            let used_requests = sqlx::query_scalar::<_, i64>(
+                r#"
+SELECT CAST(COUNT(*) AS SIGNED)
+FROM usage_request_admissions
+WHERE subject_id = ?
+  AND state = 'active'
+  AND admitted_at >= ?
+  AND admitted_at < ?
+                "#,
+            )
+            .bind(&input.subject_id)
+            .bind(usage_policy_cost_i64(
+                window.starts_at_unix_secs,
+                "usage policy request window start",
+            )?)
+            .bind(usage_policy_cost_i64(
+                window.ends_at_unix_secs,
+                "usage policy request window end",
+            )?)
+            .fetch_one(&mut *tx)
+            .await
+            .map_sql_err()?;
+            let used_requests =
+                usage_policy_cost_u64(used_requests, "usage policy request used_requests")?;
+            if used_requests >= window.limit_requests {
+                let outcome = ReserveUsagePolicyRequestOutcome::Rejected {
+                    window_index,
+                    limit_requests: window.limit_requests,
+                    used_requests,
+                };
+                tx.commit().await.map_sql_err()?;
+                return Ok(outcome);
+            }
+        }
+
+        sqlx::query(
+            r#"
+INSERT INTO usage_request_admissions (
+  request_id, subject_id, event_token, admitted_at, retain_until,
+  state, released_at, created_at
+) VALUES (?, ?, ?, ?, ?, 'active', NULL, ?)
+ON DUPLICATE KEY UPDATE event_token = VALUES(event_token)
+            "#,
+        )
+        .bind(&input.request_id)
+        .bind(&input.subject_id)
+        .bind(&input.event_token)
+        .bind(admitted_at)
+        .bind(retain_until)
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await
+        .map_sql_err()?;
+
+        let row = sqlx::query(FIND_USAGE_POLICY_REQUEST_ADMISSION_MYSQL_SQL)
+            .bind(&input.event_token)
+            .fetch_one(&mut *tx)
+            .await
+            .map_sql_err()?;
+        let existing = usage_policy_request_admission_from_mysql_row(&row)?;
+        if existing.request_id != input.request_id || existing.subject_id != input.subject_id {
+            tx.commit().await.map_sql_err()?;
+            return Ok(ReserveUsagePolicyRequestOutcome::Conflict);
+        }
+        if existing.admitted_at_unix_secs != input.admitted_at_unix_secs {
+            return Err(DataLayerError::InvalidInput(
+                "usage policy event_token must keep its original admitted_at".to_string(),
+            ));
+        }
+        sqlx::query(
+            "UPDATE usage_request_admissions SET retain_until = GREATEST(retain_until, ?) WHERE event_token = ?",
+        )
+        .bind(retain_until)
+        .bind(&input.event_token)
+        .execute(&mut *tx)
+        .await
+        .map_sql_err()?;
+        let outcome = match existing.state {
+            UsagePolicyRequestAdmissionState::Active => ReserveUsagePolicyRequestOutcome::Allowed,
+            UsagePolicyRequestAdmissionState::Released => {
+                ReserveUsagePolicyRequestOutcome::AlreadyReleased
+            }
+        };
+        tx.commit().await.map_sql_err()?;
+        Ok(outcome)
+    }
+
+    async fn release_usage_policy_request_admission(
+        &self,
+        input: ReleaseUsagePolicyRequestAdmissionInput,
+    ) -> Result<Option<StoredUsagePolicyRequestAdmission>, DataLayerError> {
+        input.validate()?;
+        let released_at = usage_policy_cost_i64(
+            input.released_at_unix_secs,
+            "usage policy request released_at",
+        )?;
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        lock_usage_policy_subject_mysql(&mut tx, &input.subject_id).await?;
+        let row = sqlx::query(FIND_USAGE_POLICY_REQUEST_ADMISSION_MYSQL_SQL)
+            .bind(&input.event_token)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_sql_err()?;
+        let Some(row) = row else {
+            tx.commit().await.map_sql_err()?;
+            return Ok(None);
+        };
+        let mut admission = usage_policy_request_admission_from_mysql_row(&row)?;
+        if admission.request_id != input.request_id || admission.subject_id != input.subject_id {
+            tx.commit().await.map_sql_err()?;
+            return Ok(None);
+        }
+        if input.released_at_unix_secs < admission.admitted_at_unix_secs {
+            return Err(DataLayerError::InvalidInput(
+                "usage policy released_at must not precede admitted_at".to_string(),
+            ));
+        }
+        if admission.state == UsagePolicyRequestAdmissionState::Active {
+            sqlx::query(
+                "UPDATE usage_request_admissions SET state = 'released', released_at = ? WHERE event_token = ? AND state = 'active'",
+            )
+            .bind(released_at)
+            .bind(&input.event_token)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+            admission.state = UsagePolicyRequestAdmissionState::Released;
+            admission.released_at_unix_secs = Some(input.released_at_unix_secs);
+        }
+        tx.commit().await.map_sql_err()?;
+        Ok(Some(admission))
+    }
+
+    async fn cleanup_usage_policy_request_admissions(
+        &self,
+        now_unix_secs: u64,
+        batch_size: usize,
+    ) -> Result<usize, DataLayerError> {
+        if batch_size == 0 {
+            return Ok(0);
+        }
+        let now = usage_policy_cost_i64(now_unix_secs, "usage policy request cleanup timestamp")?;
+        let limit = i64::try_from(batch_size).unwrap_or(i64::MAX);
+        let result = sqlx::query(
+            r#"
+DELETE FROM usage_request_admissions
+WHERE retain_until <= ?
+ORDER BY retain_until, event_token
+LIMIT ?
+            "#,
+        )
+        .bind(now)
+        .bind(limit)
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?;
+        Ok(result.rows_affected() as usize)
+    }
+
+    async fn reserve_usage_policy_cost(
+        &self,
+        input: ReserveUsagePolicyCostInput,
+    ) -> Result<ReserveUsagePolicyCostOutcome, DataLayerError> {
+        input.validate()?;
+        let admitted_at =
+            usage_policy_cost_i64(input.admitted_at_unix_secs, "usage policy admitted_at")?;
+        let reservation_expires_at = usage_policy_cost_i64(
+            input.reservation_expires_at_unix_secs,
+            "usage policy reservation_expires_at",
+        )?;
+        let updated_at = now_unix_secs()?;
+
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        lock_usage_policy_subject_mysql(&mut tx, &input.subject_id).await?;
+        let existing_row = sqlx::query(FIND_USAGE_POLICY_COST_RESERVATION_MYSQL_SQL)
+            .bind(&input.reservation_token)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_sql_err()?;
+        let existing = existing_row
+            .as_ref()
+            .map(usage_policy_cost_reservation_from_mysql_row)
+            .transpose()?;
+        if let Some(existing) = existing.as_ref() {
+            if existing.request_id != input.request_id || existing.subject_id != input.subject_id {
+                tx.commit().await.map_sql_err()?;
+                return Ok(ReserveUsagePolicyCostOutcome::Conflict);
+            }
+            if existing.state != UsagePolicyCostReservationState::Reserved {
+                let outcome = ReserveUsagePolicyCostOutcome::AlreadyTerminal {
+                    state: existing.state,
+                };
+                tx.commit().await.map_sql_err()?;
+                return Ok(outcome);
+            }
+            if existing.admitted_at_unix_secs != input.admitted_at_unix_secs {
+                return Err(DataLayerError::InvalidInput(
+                    "usage policy reservation_token must keep its original admitted_at".to_string(),
+                ));
+            }
+        }
+
+        let previous_reserved_cost_units = existing
+            .as_ref()
+            .map(|reservation| reservation.reserved_cost_units)
+            .unwrap_or(0);
+        let target_reserved_cost_units =
+            previous_reserved_cost_units.max(input.reserved_cost_units);
+        for (window_index, window) in input.windows.iter().enumerate() {
+            let window_start =
+                usage_policy_cost_i64(window.starts_at_unix_secs, "usage policy window start")?;
+            let window_end =
+                usage_policy_cost_i64(window.ends_at_unix_secs, "usage policy window end")?;
+            let used_cost_units = sqlx::query_scalar::<_, i64>(
+                r#"
+SELECT CAST(COALESCE(SUM(
+  CASE
+    WHEN state = 'finalized' THEN COALESCE(actual_cost_units, 0)
+    WHEN state = 'reserved' AND reservation_expires_at > ? THEN reserved_cost_units
+    ELSE 0
+  END
+), 0) AS SIGNED)
+FROM usage_cost_reservations
+WHERE subject_id = ?
+  AND admitted_at >= ?
+  AND admitted_at < ?
+  AND reservation_token <> ?
+                "#,
+            )
+            .bind(admitted_at)
+            .bind(&input.subject_id)
+            .bind(window_start)
+            .bind(window_end)
+            .bind(&input.reservation_token)
+            .fetch_one(&mut *tx)
+            .await
+            .map_sql_err()?;
+            let used_cost_units =
+                usage_policy_cost_u64(used_cost_units, "usage policy used_cost_units")?;
+            if used_cost_units
+                .checked_add(target_reserved_cost_units)
+                .is_none_or(|total| total > window.limit_cost_units)
+            {
+                let outcome = ReserveUsagePolicyCostOutcome::Rejected {
+                    window_index,
+                    limit_cost_units: window.limit_cost_units,
+                    used_cost_units,
+                };
+                tx.commit().await.map_sql_err()?;
+                return Ok(outcome);
+            }
+        }
+
+        let admitted_at = existing
+            .as_ref()
+            .map(|reservation| {
+                usage_policy_cost_i64(
+                    reservation.admitted_at_unix_secs,
+                    "usage policy admitted_at",
+                )
+            })
+            .transpose()?
+            .unwrap_or(admitted_at);
+        sqlx::query(
+            r#"
+INSERT INTO usage_cost_reservations (
+  request_id, subject_id, reservation_token, admitted_at,
+  reserved_cost_units, actual_cost_units,
+  state, reservation_expires_at, retain_until, finalized_at, created_at, updated_at
+)
+VALUES (?, ?, ?, ?, ?, NULL, 'reserved', ?, ?, NULL, ?, ?)
+ON DUPLICATE KEY UPDATE
+  reserved_cost_units = GREATEST(reserved_cost_units, VALUES(reserved_cost_units)),
+  reservation_expires_at = GREATEST(
+    reservation_expires_at,
+    VALUES(reservation_expires_at)
+  ),
+  retain_until = GREATEST(retain_until, VALUES(retain_until)),
+  updated_at = VALUES(updated_at)
+            "#,
+        )
+        .bind(&input.request_id)
+        .bind(&input.subject_id)
+        .bind(&input.reservation_token)
+        .bind(admitted_at)
+        .bind(usage_policy_cost_i64(
+            target_reserved_cost_units,
+            "usage policy reserved_cost_units",
+        )?)
+        .bind(reservation_expires_at)
+        .bind(usage_policy_cost_i64(
+            input.retain_until_unix_secs,
+            "usage policy retain_until",
+        )?)
+        .bind(updated_at)
+        .bind(updated_at)
+        .execute(&mut *tx)
+        .await
+        .map_sql_err()?;
+
+        tx.commit().await.map_sql_err()?;
+        Ok(ReserveUsagePolicyCostOutcome::Allowed {
+            reserved_cost_units: target_reserved_cost_units,
+            additional_reserved_cost_units: target_reserved_cost_units
+                .saturating_sub(previous_reserved_cost_units),
+        })
+    }
+
+    async fn reconcile_usage_policy_cost(
+        &self,
+        input: ReconcileUsagePolicyCostInput,
+    ) -> Result<Option<StoredUsagePolicyCostReservation>, DataLayerError> {
+        input.validate()?;
+        let actual_cost_units =
+            usage_policy_cost_i64(input.actual_cost_units, "usage policy actual_cost_units")?;
+        let finalized_at =
+            usage_policy_cost_i64(input.finalized_at_unix_secs, "usage policy finalized_at")?;
+        let updated_at = now_unix_secs()?;
+
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        lock_usage_policy_subject_mysql(&mut tx, &input.subject_id).await?;
+        let row = sqlx::query(FIND_USAGE_POLICY_COST_RESERVATION_MYSQL_SQL)
+            .bind(&input.reservation_token)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_sql_err()?;
+        let Some(row) = row else {
+            tx.commit().await.map_sql_err()?;
+            return Ok(None);
+        };
+        let mut reservation = usage_policy_cost_reservation_from_mysql_row(&row)?;
+        if reservation.request_id != input.request_id || reservation.subject_id != input.subject_id
+        {
+            // The token selects the row; audit identity must still match before the reservation
+            // can be finalized.
+            tx.commit().await.map_sql_err()?;
+            return Ok(None);
+        }
+        if reservation.state == UsagePolicyCostReservationState::Reserved {
+            sqlx::query(
+                r#"
+UPDATE usage_cost_reservations
+SET state = ?,
+    actual_cost_units = ?,
+    finalized_at = ?,
+    updated_at = ?
+WHERE reservation_token = ?
+  AND request_id = ?
+  AND subject_id = ?
+  AND state = 'reserved'
+                "#,
+            )
+            .bind(input.terminal_state.as_str())
+            .bind(actual_cost_units)
+            .bind(finalized_at)
+            .bind(updated_at)
+            .bind(&input.reservation_token)
+            .bind(&input.request_id)
+            .bind(&input.subject_id)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+            reservation.state = input.terminal_state;
+            reservation.actual_cost_units = Some(input.actual_cost_units);
+            reservation.finalized_at_unix_secs = Some(input.finalized_at_unix_secs);
+        }
+
+        tx.commit().await.map_sql_err()?;
+        Ok(Some(reservation))
+    }
+
+    async fn cleanup_usage_policy_cost_reservations(
+        &self,
+        now_unix_secs: u64,
+        batch_size: usize,
+    ) -> Result<usize, DataLayerError> {
+        if batch_size == 0 {
+            return Ok(0);
+        }
+        let now = usage_policy_cost_i64(now_unix_secs, "usage policy cleanup timestamp")?;
+        let limit = i64::try_from(batch_size).unwrap_or(i64::MAX);
+        let result = sqlx::query(
+            r#"
+DELETE FROM usage_cost_reservations
+WHERE retain_until <= ?
+ORDER BY retain_until, reservation_token
+LIMIT ?
+            "#,
+        )
+        .bind(now)
+        .bind(limit)
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?;
+        Ok(result.rows_affected() as usize)
+    }
+
     async fn settle_usage(
         &self,
         input: UsageSettlementInput,
@@ -703,10 +1304,11 @@ WHERE id = ?
 
 #[cfg(test)]
 mod tests {
-    use super::MysqlSettlementRepository;
+    use super::{MysqlSettlementRepository, USAGE_POLICY_REQUEST_TRANSACTION_ISOLATION_MYSQL_SQL};
     use crate::run_migrations;
     use aether_data_contracts::repository::settlement::{
-        SettlementWriteRepository, UsageSettlementInput,
+        ReserveUsagePolicyRequestInput, ReserveUsagePolicyRequestOutcome,
+        SettlementWriteRepository, UsagePolicyRequestWindow, UsageSettlementInput,
     };
 
     #[tokio::test]
@@ -718,6 +1320,89 @@ mod tests {
         );
 
         let _repository = MysqlSettlementRepository::new(pool);
+    }
+
+    #[test]
+    fn request_admission_transactions_use_read_committed() {
+        assert_eq!(
+            USAGE_POLICY_REQUEST_TRANSACTION_ISOLATION_MYSQL_SQL,
+            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cross_subject_same_token_is_allowed_once_without_deadlock_when_url_is_set() {
+        let Some(database_url) = std::env::var("AETHER_TEST_MYSQL_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            eprintln!(
+                "skipping mysql request admission race test because AETHER_TEST_MYSQL_URL is unset"
+            );
+            return;
+        };
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .expect("mysql pool should connect");
+        run_migrations(&pool)
+            .await
+            .expect("mysql migrations should run");
+        cleanup_request_admission_rows(&pool).await;
+        sqlx::query(
+            r#"
+INSERT INTO users (id, username, auth_source, created_at, updated_at)
+VALUES
+  ('admission-race-user-1', 'admission-race-user-1', 'local', 1, 1),
+  ('admission-race-user-2', 'admission-race-user-2', 'local', 1, 1)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("race users should seed");
+
+        let repository = MysqlSettlementRepository::new(pool.clone());
+        let reserve = |request_id: &str, subject_id: &str| ReserveUsagePolicyRequestInput {
+            request_id: request_id.to_string(),
+            subject_id: subject_id.to_string(),
+            event_token: "admission-race-token".to_string(),
+            admitted_at_unix_secs: 100,
+            retain_until_unix_secs: 1_000,
+            windows: vec![UsagePolicyRequestWindow {
+                starts_at_unix_secs: 0,
+                ends_at_unix_secs: 1_000,
+                limit_requests: 10,
+            }],
+        };
+        let (first, second) = tokio::join!(
+            repository.reserve_usage_policy_request(reserve(
+                "admission-race-request-1",
+                "admission-race-user-1"
+            )),
+            repository.reserve_usage_policy_request(reserve(
+                "admission-race-request-2",
+                "admission-race-user-2"
+            ))
+        );
+        let mut outcomes = vec![
+            first.expect("first reserve should not deadlock"),
+            second.expect("second reserve should not deadlock"),
+        ];
+        outcomes.sort_by_key(|outcome| match outcome {
+            ReserveUsagePolicyRequestOutcome::Allowed => 0,
+            ReserveUsagePolicyRequestOutcome::Conflict => 1,
+            _ => 2,
+        });
+        assert_eq!(
+            outcomes,
+            vec![
+                ReserveUsagePolicyRequestOutcome::Allowed,
+                ReserveUsagePolicyRequestOutcome::Conflict,
+            ]
+        );
+
+        cleanup_request_admission_rows(&pool).await;
     }
 
     #[tokio::test]
@@ -846,5 +1531,20 @@ WHERE request_id = 'settlement-request-1'
                 .await
                 .expect("settlement cleanup should succeed");
         }
+    }
+
+    async fn cleanup_request_admission_rows(pool: &sqlx::MySqlPool) {
+        sqlx::query(
+            "DELETE FROM usage_request_admissions WHERE event_token = 'admission-race-token'",
+        )
+        .execute(pool)
+        .await
+        .expect("admission race row cleanup should succeed");
+        sqlx::query(
+            "DELETE FROM users WHERE id IN ('admission-race-user-1', 'admission-race-user-2')",
+        )
+        .execute(pool)
+        .await
+        .expect("admission race user cleanup should succeed");
     }
 }

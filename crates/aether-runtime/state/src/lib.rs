@@ -139,6 +139,16 @@ impl RuntimeStateConfig {
                 "runtime memory max_kv_entries must be positive".to_string(),
             ));
         }
+        if self.memory.max_usage_limit_windows == 0 {
+            return Err(DataLayerError::InvalidConfiguration(
+                "runtime memory max_usage_limit_windows must be positive".to_string(),
+            ));
+        }
+        if self.memory.max_usage_limit_events == 0 {
+            return Err(DataLayerError::InvalidConfiguration(
+                "runtime memory max_usage_limit_events must be positive".to_string(),
+            ));
+        }
         if matches!(self.command_timeout_ms, Some(0)) {
             return Err(DataLayerError::InvalidConfiguration(
                 "runtime state command_timeout_ms must be positive".to_string(),
@@ -464,6 +474,42 @@ impl RuntimeState {
         }
     }
 
+    pub async fn check_and_consume_usage_limits(
+        &self,
+        input: UsageLimitInput<'_>,
+    ) -> Result<UsageLimitCheck, DataLayerError> {
+        if input.rules.is_empty() {
+            return Ok(UsageLimitCheck::Allowed);
+        }
+        validate_usage_limit_input(input)?;
+        match self.backend.as_ref() {
+            RuntimeStateBackend::Memory(memory) => {
+                memory.check_and_consume_usage_limits(input).await
+            }
+            RuntimeStateBackend::Redis(redis) => {
+                redis.runtime.check_and_consume_usage_limits(input).await
+            }
+        }
+    }
+
+    /// Removes an idempotency event from every supplied usage-limit window.
+    ///
+    /// This is a compensation primitive for callers that compose the short-lived runtime
+    /// counters with a second durable admission store. It is intentionally idempotent.
+    pub async fn release_usage_limits(
+        &self,
+        input: UsageLimitReleaseInput<'_>,
+    ) -> Result<(), DataLayerError> {
+        if input.rules.is_empty() {
+            return Ok(());
+        }
+        validate_usage_limit_release_input(input)?;
+        match self.backend.as_ref() {
+            RuntimeStateBackend::Memory(memory) => memory.release_usage_limits(input).await,
+            RuntimeStateBackend::Redis(redis) => redis.runtime.release_usage_limits(input).await,
+        }
+    }
+
     pub async fn rate_limit_count(&self, key: &str, bucket: u64) -> Result<u32, DataLayerError> {
         match self.backend.as_ref() {
             RuntimeStateBackend::Memory(memory) => memory.rate_limit_count(key, bucket),
@@ -719,6 +765,16 @@ impl RuntimeState {
     ) -> Result<RuntimeSemaphore, RuntimeSemaphoreError> {
         RuntimeSemaphore::new(self.clone(), gate, limit, config)
     }
+
+    pub fn keyed_semaphore(
+        &self,
+        gate: &'static str,
+        key: impl Into<String>,
+        limit: usize,
+        config: RuntimeSemaphoreConfig,
+    ) -> Result<RuntimeSemaphore, RuntimeSemaphoreError> {
+        RuntimeSemaphore::new_with_key(self.clone(), gate, key.into(), limit, config)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -759,6 +815,197 @@ pub struct RateLimitInput<'a> {
     pub user_limit: u32,
     pub key_limit: u32,
     pub ttl_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageLimitRule<'a> {
+    /// A caller-defined key containing the same non-empty Redis hash tag as every sibling rule.
+    /// The key must change when the rule's window definition changes.
+    pub key: &'a str,
+    pub limit: u64,
+    /// Duration used to decide which events still count toward the limit.
+    pub window_seconds: u64,
+    /// Duration for retaining this rule's backing state after the current check.
+    pub retention_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageLimitInput<'a> {
+    pub rules: &'a [UsageLimitRule<'a>],
+    pub event_id: &'a str,
+    pub now_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageLimitReleaseInput<'a> {
+    pub rules: &'a [UsageLimitRule<'a>],
+    pub event_id: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageLimitCheck {
+    Allowed,
+    Rejected {
+        rule_index: usize,
+        limit: u64,
+        retry_after: u64,
+    },
+}
+
+const MAX_REDIS_LUA_EXACT_INTEGER: u64 = (1_u64 << 53) - 1;
+
+fn validate_usage_limit_input(input: UsageLimitInput<'_>) -> Result<(), DataLayerError> {
+    if input.event_id.trim().is_empty() {
+        return Err(DataLayerError::InvalidInput(
+            "usage limit event_id must not be empty".to_string(),
+        ));
+    }
+    if input.now_unix_ms > MAX_REDIS_LUA_EXACT_INTEGER {
+        return Err(DataLayerError::InvalidInput(
+            "usage limit now_unix_ms exceeds the exact Redis Lua integer range".to_string(),
+        ));
+    }
+
+    let mut expected_hash_tag = None;
+    for (index, rule) in input.rules.iter().enumerate() {
+        if rule.key.trim().is_empty() {
+            return Err(DataLayerError::InvalidInput(format!(
+                "usage limit rule {index} key must not be empty"
+            )));
+        }
+        if rule.limit == 0 {
+            return Err(DataLayerError::InvalidInput(format!(
+                "usage limit rule {index} must have a positive limit"
+            )));
+        }
+        if rule.limit > MAX_REDIS_LUA_EXACT_INTEGER {
+            return Err(DataLayerError::InvalidInput(format!(
+                "usage limit rule {index} limit exceeds the exact Redis Lua integer range"
+            )));
+        }
+        if rule.window_seconds == 0 {
+            return Err(DataLayerError::InvalidInput(format!(
+                "usage limit rule {index} must have a positive window_seconds"
+            )));
+        }
+        let window_ms = rule.window_seconds.checked_mul(1_000).ok_or_else(|| {
+            DataLayerError::InvalidInput(format!(
+                "usage limit rule {index} window_seconds is too large"
+            ))
+        })?;
+        if window_ms > MAX_REDIS_LUA_EXACT_INTEGER {
+            return Err(DataLayerError::InvalidInput(format!(
+                "usage limit rule {index} window_seconds exceeds the exact Redis Lua integer range"
+            )));
+        }
+        if rule.retention_seconds == 0 {
+            return Err(DataLayerError::InvalidInput(format!(
+                "usage limit rule {index} must have a positive retention_seconds"
+            )));
+        }
+        let retention_ms = rule.retention_seconds.checked_mul(1_000).ok_or_else(|| {
+            DataLayerError::InvalidInput(format!(
+                "usage limit rule {index} retention_seconds is too large"
+            ))
+        })?;
+        if retention_ms > MAX_REDIS_LUA_EXACT_INTEGER {
+            return Err(DataLayerError::InvalidInput(format!(
+                "usage limit rule {index} retention_seconds exceeds the exact Redis Lua integer range"
+            )));
+        }
+        if input
+            .now_unix_ms
+            .checked_add(window_ms)
+            .is_none_or(|expires_at| expires_at > MAX_REDIS_LUA_EXACT_INTEGER)
+        {
+            return Err(DataLayerError::InvalidInput(format!(
+                "usage limit rule {index} window extends beyond the exact Redis Lua integer range"
+            )));
+        }
+        if input
+            .now_unix_ms
+            .checked_add(retention_ms)
+            .is_none_or(|expires_at| expires_at > MAX_REDIS_LUA_EXACT_INTEGER)
+        {
+            return Err(DataLayerError::InvalidInput(format!(
+                "usage limit rule {index} retention extends beyond the exact Redis Lua integer range"
+            )));
+        }
+        if input.rules[..index]
+            .iter()
+            .any(|previous| previous.key == rule.key)
+        {
+            return Err(DataLayerError::InvalidInput(format!(
+                "usage limit rule {index} duplicates key {}",
+                rule.key
+            )));
+        }
+
+        let hash_tag = redis_hash_tag(rule.key).ok_or_else(|| {
+            DataLayerError::InvalidInput(format!(
+                "usage limit rule {index} key must contain a non-empty Redis hash tag"
+            ))
+        })?;
+        if let Some(expected) = expected_hash_tag {
+            if hash_tag != expected {
+                return Err(DataLayerError::InvalidInput(
+                    "usage limit rule keys must use the same Redis hash tag".to_string(),
+                ));
+            }
+        } else {
+            expected_hash_tag = Some(hash_tag);
+        }
+    }
+    Ok(())
+}
+
+fn validate_usage_limit_release_input(
+    input: UsageLimitReleaseInput<'_>,
+) -> Result<(), DataLayerError> {
+    if input.event_id.trim().is_empty() {
+        return Err(DataLayerError::InvalidInput(
+            "usage limit event_id must not be empty".to_string(),
+        ));
+    }
+    let mut expected_hash_tag = None;
+    for (index, rule) in input.rules.iter().enumerate() {
+        if rule.key.trim().is_empty() {
+            return Err(DataLayerError::InvalidInput(format!(
+                "usage limit rule {index} key must not be empty"
+            )));
+        }
+        if input.rules[..index]
+            .iter()
+            .any(|previous| previous.key == rule.key)
+        {
+            return Err(DataLayerError::InvalidInput(format!(
+                "usage limit rule {index} duplicates key {}",
+                rule.key
+            )));
+        }
+        let hash_tag = redis_hash_tag(rule.key).ok_or_else(|| {
+            DataLayerError::InvalidInput(format!(
+                "usage limit rule {index} key must contain a non-empty Redis hash tag"
+            ))
+        })?;
+        if let Some(expected) = expected_hash_tag {
+            if hash_tag != expected {
+                return Err(DataLayerError::InvalidInput(
+                    "usage limit rule keys must use the same Redis hash tag".to_string(),
+                ));
+            }
+        } else {
+            expected_hash_tag = Some(hash_tag);
+        }
+    }
+    Ok(())
+}
+
+fn redis_hash_tag(key: &str) -> Option<&str> {
+    let tag_start = key.find('{')?.saturating_add(1);
+    let remainder = key.get(tag_start..)?;
+    let tag_end = remainder.find('}')?;
+    (tag_end > 0).then_some(&remainder[..tag_end])
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1205,6 +1452,16 @@ impl RuntimeSemaphore {
         limit: usize,
         config: RuntimeSemaphoreConfig,
     ) -> Result<Self, RuntimeSemaphoreError> {
+        Self::new_with_key(runtime, gate, format!("admission:{gate}"), limit, config)
+    }
+
+    fn new_with_key(
+        runtime: RuntimeState,
+        gate: &'static str,
+        key: String,
+        limit: usize,
+        config: RuntimeSemaphoreConfig,
+    ) -> Result<Self, RuntimeSemaphoreError> {
         if limit == 0 {
             return Err(RuntimeSemaphoreError::InvalidConfiguration(
                 "runtime semaphore limit must be positive".to_string(),
@@ -1222,7 +1479,7 @@ impl RuntimeSemaphore {
         }
         Ok(Self {
             state: Arc::new(RuntimeSemaphoreState {
-                key: format!("admission:{gate}"),
+                key,
                 runtime,
                 gate,
                 limit,
@@ -1638,6 +1895,325 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_usage_limits_check_all_windows_before_consuming() {
+        let runtime = RuntimeState::memory(MemoryRuntimeStateConfig::default());
+        let rules = [
+            UsageLimitRule {
+                key: "usage:{user-1}:qps",
+                limit: 2,
+                window_seconds: 10,
+                retention_seconds: 10,
+            },
+            UsageLimitRule {
+                key: "usage:{user-1}:weekly",
+                limit: 1,
+                window_seconds: 60,
+                retention_seconds: 60,
+            },
+        ];
+
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(UsageLimitInput {
+                    rules: &rules,
+                    event_id: "request-1",
+                    now_unix_ms: 100_000,
+                })
+                .await
+                .expect("first request"),
+            UsageLimitCheck::Allowed
+        );
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(UsageLimitInput {
+                    rules: &rules,
+                    event_id: "request-2",
+                    now_unix_ms: 105_000,
+                })
+                .await
+                .expect("second request"),
+            UsageLimitCheck::Rejected {
+                rule_index: 1,
+                limit: 1,
+                retry_after: 55,
+            }
+        );
+
+        let qps_only = [rules[0]];
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(UsageLimitInput {
+                    rules: &qps_only,
+                    event_id: "request-3",
+                    now_unix_ms: 105_000,
+                })
+                .await
+                .expect("weekly rejection must not consume qps"),
+            UsageLimitCheck::Allowed
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_usage_limits_are_true_sliding_windows_and_idempotent() {
+        let runtime = RuntimeState::memory(MemoryRuntimeStateConfig::default());
+        let rules = [UsageLimitRule {
+            key: "usage:{user-1}:rolling-10",
+            limit: 2,
+            window_seconds: 10,
+            retention_seconds: 10,
+        }];
+        let consume = |event_id, now_unix_ms| UsageLimitInput {
+            rules: &rules,
+            event_id,
+            now_unix_ms,
+        };
+
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(consume("request-1", 100_000))
+                .await
+                .unwrap(),
+            UsageLimitCheck::Allowed
+        );
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(consume("request-2", 105_000))
+                .await
+                .unwrap(),
+            UsageLimitCheck::Allowed
+        );
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(consume("request-2", 106_000))
+                .await
+                .unwrap(),
+            UsageLimitCheck::Allowed,
+            "replaying the same event must not consume twice"
+        );
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(consume("request-3", 109_000))
+                .await
+                .unwrap(),
+            UsageLimitCheck::Rejected {
+                rule_index: 0,
+                limit: 2,
+                retry_after: 1,
+            }
+        );
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(consume("request-3", 110_000))
+                .await
+                .unwrap(),
+            UsageLimitCheck::Allowed,
+            "the event at the exact rolling cutoff must expire"
+        );
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(consume("request-4", 111_000))
+                .await
+                .unwrap(),
+            UsageLimitCheck::Rejected {
+                rule_index: 0,
+                limit: 2,
+                retry_after: 4,
+            },
+            "the first event's expiry must not reset when later events arrive"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_limit_input_requires_unique_co_located_rule_keys() {
+        let runtime = RuntimeState::memory(MemoryRuntimeStateConfig::default());
+        let different_tags = [
+            UsageLimitRule {
+                key: "usage:{user-1}:one",
+                limit: 1,
+                window_seconds: 1,
+                retention_seconds: 1,
+            },
+            UsageLimitRule {
+                key: "usage:{user-2}:two",
+                limit: 1,
+                window_seconds: 1,
+                retention_seconds: 1,
+            },
+        ];
+        assert!(matches!(
+            runtime
+                .check_and_consume_usage_limits(UsageLimitInput {
+                    rules: &different_tags,
+                    event_id: "request-1",
+                    now_unix_ms: 100_000,
+                })
+                .await,
+            Err(DataLayerError::InvalidInput(_))
+        ));
+
+        let zero_retention = [UsageLimitRule {
+            retention_seconds: 0,
+            ..different_tags[0]
+        }];
+        assert!(matches!(
+            runtime
+                .check_and_consume_usage_limits(UsageLimitInput {
+                    rules: &zero_retention,
+                    event_id: "request-1",
+                    now_unix_ms: 100_000,
+                })
+                .await,
+            Err(DataLayerError::InvalidInput(message))
+                if message.contains("retention_seconds")
+        ));
+
+        let duplicate_keys = [different_tags[0], different_tags[0]];
+        assert!(matches!(
+            runtime
+                .check_and_consume_usage_limits(UsageLimitInput {
+                    rules: &duplicate_keys,
+                    event_id: "request-1",
+                    now_unix_ms: 100_000,
+                })
+                .await,
+            Err(DataLayerError::InvalidInput(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn memory_usage_limits_apply_the_current_window_when_configuration_changes() {
+        let runtime = RuntimeState::memory(MemoryRuntimeStateConfig::default());
+        let long_window = [UsageLimitRule {
+            key: "usage:{user-1}:changing-window",
+            limit: 1,
+            window_seconds: 60,
+            retention_seconds: 60,
+        }];
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(UsageLimitInput {
+                    rules: &long_window,
+                    event_id: "request-1",
+                    now_unix_ms: 100_000,
+                })
+                .await
+                .unwrap(),
+            UsageLimitCheck::Allowed
+        );
+
+        let short_window = [UsageLimitRule {
+            window_seconds: 10,
+            retention_seconds: 10,
+            ..long_window[0]
+        }];
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(UsageLimitInput {
+                    rules: &short_window,
+                    event_id: "request-2",
+                    now_unix_ms: 111_000,
+                })
+                .await
+                .unwrap(),
+            UsageLimitCheck::Allowed,
+            "the old event is outside the newly configured shorter window"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_usage_limits_keep_subsecond_events_in_a_one_second_window() {
+        let runtime = RuntimeState::memory(MemoryRuntimeStateConfig::default());
+        let rules = [UsageLimitRule {
+            key: "usage:{user-1}:qps",
+            limit: 1,
+            window_seconds: 1,
+            retention_seconds: 1,
+        }];
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(UsageLimitInput {
+                    rules: &rules,
+                    event_id: "request-1",
+                    now_unix_ms: 1_900,
+                })
+                .await
+                .unwrap(),
+            UsageLimitCheck::Allowed
+        );
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(UsageLimitInput {
+                    rules: &rules,
+                    event_id: "request-2",
+                    now_unix_ms: 2_100,
+                })
+                .await
+                .unwrap(),
+            UsageLimitCheck::Rejected {
+                rule_index: 0,
+                limit: 1,
+                retry_after: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_usage_limits_do_not_expire_epoch_events_before_the_window_elapses() {
+        let runtime = RuntimeState::memory(MemoryRuntimeStateConfig::default());
+        let rules = [UsageLimitRule {
+            key: "usage:{user-1}:epoch",
+            limit: 1,
+            window_seconds: 1,
+            retention_seconds: 1,
+        }];
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(UsageLimitInput {
+                    rules: &rules,
+                    event_id: "request-1",
+                    now_unix_ms: 0,
+                })
+                .await
+                .unwrap(),
+            UsageLimitCheck::Allowed
+        );
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(UsageLimitInput {
+                    rules: &rules,
+                    event_id: "request-2",
+                    now_unix_ms: 500,
+                })
+                .await
+                .unwrap(),
+            UsageLimitCheck::Rejected {
+                rule_index: 0,
+                limit: 1,
+                retry_after: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_memory_usage_limit_capacity_must_be_positive() {
+        let mut config = RuntimeStateConfig::memory();
+        config.memory.max_usage_limit_windows = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(DataLayerError::InvalidConfiguration(message))
+                if message.contains("max_usage_limit_windows")
+        ));
+
+        let mut config = RuntimeStateConfig::memory();
+        config.memory.max_usage_limit_events = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(DataLayerError::InvalidConfiguration(message))
+                if message.contains("max_usage_limit_events")
+        ));
+    }
+
+    #[tokio::test]
     async fn memory_rate_limit_concurrent_checks_do_not_exceed_limit() {
         let runtime =
             std::sync::Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default()));
@@ -1731,6 +2307,50 @@ mod tests {
         drop(permit);
         tokio::time::sleep(Duration::from_millis(5)).await;
         assert_eq!(gate.snapshot().await.expect("snapshot").in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn keyed_memory_semaphores_share_only_the_same_subject_key() {
+        let runtime = RuntimeState::memory(MemoryRuntimeStateConfig::default());
+        let first = runtime
+            .keyed_semaphore(
+                "plan_usage_concurrency",
+                "admission:plan_usage_concurrency:user-1",
+                1,
+                RuntimeSemaphoreConfig::default(),
+            )
+            .expect("first gate");
+        let same_subject = runtime
+            .keyed_semaphore(
+                "plan_usage_concurrency",
+                "admission:plan_usage_concurrency:user-1",
+                1,
+                RuntimeSemaphoreConfig::default(),
+            )
+            .expect("same subject gate");
+        let other_subject = runtime
+            .keyed_semaphore(
+                "plan_usage_concurrency",
+                "admission:plan_usage_concurrency:user-2",
+                1,
+                RuntimeSemaphoreConfig::default(),
+            )
+            .expect("other subject gate");
+
+        let permit = first.try_acquire().await.expect("first permit");
+        assert!(matches!(
+            same_subject.try_acquire().await,
+            Err(RuntimeSemaphoreError::Saturated { limit: 1, .. })
+        ));
+        assert!(other_subject.try_acquire().await.is_ok());
+        drop(permit);
+        for _ in 0..20 {
+            if same_subject.snapshot().await.expect("snapshot").in_flight == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(same_subject.try_acquire().await.is_ok());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2064,6 +2684,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_backends_share_atomic_sliding_usage_limit_contract() {
+        let memory = RuntimeState::memory(MemoryRuntimeStateConfig::default());
+        assert_sliding_usage_limit_contract(&memory).await;
+        assert_concurrent_usage_limit_cap(&memory).await;
+
+        let Some((_redis, redis_runtime)) = redis_runtime_for_test("usage-limits").await else {
+            return;
+        };
+        assert_sliding_usage_limit_contract(&redis_runtime).await;
+        assert_concurrent_usage_limit_cap(&redis_runtime).await;
+    }
+
+    #[tokio::test]
+    async fn runtime_backends_share_short_remaining_usage_limit_retention_contract() {
+        let memory = RuntimeState::memory(MemoryRuntimeStateConfig::default());
+        let redis = redis_runtime_for_test("usage-limit-retention").await;
+        let rules = [UsageLimitRule {
+            key: "usage:{retention-user}:period-bucket",
+            limit: 1,
+            window_seconds: 60,
+            retention_seconds: 1,
+        }];
+
+        assert_usage_limit_retention_seed(&memory, &rules).await;
+        if let Some((_, redis_runtime)) = &redis {
+            assert_usage_limit_retention_seed(redis_runtime, &rules).await;
+        }
+
+        // Redis deliberately adds one second of expiry grace to the requested retention.
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+
+        assert_usage_limit_retention_expired(&memory, &rules).await;
+        if let Some((_, redis_runtime)) = &redis {
+            assert_usage_limit_retention_expired(redis_runtime, &rules).await;
+        }
+    }
+
+    #[tokio::test]
     async fn memory_blocking_queue_read_does_not_block_kv_operations() {
         let runtime = RuntimeState::memory(MemoryRuntimeStateConfig::default());
         RuntimeQueueStore::ensure_consumer_group(&runtime, "memory-blocking", "workers", "0-0")
@@ -2353,6 +3011,209 @@ mod tests {
             .await,
             Err(DataLayerError::InvalidInput(_))
         ));
+    }
+
+    async fn assert_sliding_usage_limit_contract(runtime: &RuntimeState) {
+        let rules = [
+            UsageLimitRule {
+                key: "usage:{shared-user}:short",
+                limit: 2,
+                window_seconds: 10,
+                retention_seconds: 10,
+            },
+            UsageLimitRule {
+                key: "usage:{shared-user}:long",
+                limit: 1,
+                window_seconds: 60,
+                retention_seconds: 60,
+            },
+        ];
+        let consume = |event_id, now_unix_ms, rules| UsageLimitInput {
+            rules,
+            event_id,
+            now_unix_ms,
+        };
+
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(consume("event-1", 100_000, &rules))
+                .await
+                .expect("first event"),
+            UsageLimitCheck::Allowed
+        );
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(consume("event-1", 101_000, &rules))
+                .await
+                .expect("idempotent replay"),
+            UsageLimitCheck::Allowed
+        );
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(consume("event-2", 105_000, &rules))
+                .await
+                .expect("long window rejection"),
+            UsageLimitCheck::Rejected {
+                rule_index: 1,
+                limit: 1,
+                retry_after: 55,
+            }
+        );
+
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(consume("event-3", 105_000, &rules[..1]))
+                .await
+                .expect("rejection must leave short rule untouched"),
+            UsageLimitCheck::Allowed
+        );
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(consume("event-4", 109_000, &rules[..1]))
+                .await
+                .expect("short rule rejection"),
+            UsageLimitCheck::Rejected {
+                rule_index: 0,
+                limit: 2,
+                retry_after: 1,
+            }
+        );
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(consume("event-4", 110_000, &rules[..1]))
+                .await
+                .expect("event at cutoff expires"),
+            UsageLimitCheck::Allowed
+        );
+
+        let qps = [UsageLimitRule {
+            key: "usage:{shared-user}:qps",
+            limit: 1,
+            window_seconds: 1,
+            retention_seconds: 1,
+        }];
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(consume("qps-1", 200_900, &qps))
+                .await
+                .expect("first qps event"),
+            UsageLimitCheck::Allowed
+        );
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(consume("qps-2", 201_100, &qps))
+                .await
+                .expect("subsecond qps rejection"),
+            UsageLimitCheck::Rejected {
+                rule_index: 0,
+                limit: 1,
+                retry_after: 1,
+            }
+        );
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(consume("qps-2", 201_900, &qps))
+                .await
+                .expect("qps event at cutoff"),
+            UsageLimitCheck::Allowed
+        );
+
+        runtime
+            .release_usage_limits(UsageLimitReleaseInput {
+                rules: &qps,
+                event_id: "qps-2",
+            })
+            .await
+            .expect("release consumed qps event");
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(consume("qps-3", 201_900, &qps))
+                .await
+                .expect("released qps capacity should be reusable"),
+            UsageLimitCheck::Allowed
+        );
+        runtime
+            .release_usage_limits(UsageLimitReleaseInput {
+                rules: &qps,
+                event_id: "qps-2",
+            })
+            .await
+            .expect("release should be idempotent");
+    }
+
+    async fn assert_usage_limit_retention_seed(
+        runtime: &RuntimeState,
+        rules: &[UsageLimitRule<'_>],
+    ) {
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(UsageLimitInput {
+                    rules,
+                    event_id: "period-event-1",
+                    now_unix_ms: 100_000,
+                })
+                .await
+                .expect("seed short-retention period bucket"),
+            UsageLimitCheck::Allowed
+        );
+    }
+
+    async fn assert_usage_limit_retention_expired(
+        runtime: &RuntimeState,
+        rules: &[UsageLimitRule<'_>],
+    ) {
+        assert_eq!(
+            runtime
+                .check_and_consume_usage_limits(UsageLimitInput {
+                    rules,
+                    event_id: "period-event-2",
+                    now_unix_ms: 102_200,
+                })
+                .await
+                .expect("expired period bucket must be reusable"),
+            UsageLimitCheck::Allowed,
+            "retention must expire the bucket before its full counting window"
+        );
+    }
+
+    async fn assert_concurrent_usage_limit_cap(runtime: &RuntimeState) {
+        let mut tasks = Vec::new();
+        for index in 0..64 {
+            let runtime = runtime.clone();
+            tasks.push(tokio::spawn(async move {
+                let event_id = format!("parallel-event-{index}");
+                let rules = [UsageLimitRule {
+                    key: "usage:{shared-user}:parallel",
+                    limit: 8,
+                    window_seconds: 60,
+                    retention_seconds: 60,
+                }];
+                runtime
+                    .check_and_consume_usage_limits(UsageLimitInput {
+                        rules: &rules,
+                        event_id: &event_id,
+                        now_unix_ms: 300_000,
+                    })
+                    .await
+                    .expect("concurrent usage limit check")
+            }));
+        }
+
+        let mut allowed = 0;
+        let mut rejected = 0;
+        for task in tasks {
+            match task.await.expect("concurrent usage limit task") {
+                UsageLimitCheck::Allowed => allowed += 1,
+                UsageLimitCheck::Rejected {
+                    rule_index: 0,
+                    limit: 8,
+                    retry_after: 60,
+                } => rejected += 1,
+                unexpected => panic!("unexpected usage limit result: {unexpected:?}"),
+            }
+        }
+        assert_eq!(allowed, 8);
+        assert_eq!(rejected, 56);
     }
 
     async fn redis_runtime_for_test(prefix: &str) -> Option<(TestRedisServer, RuntimeState)> {

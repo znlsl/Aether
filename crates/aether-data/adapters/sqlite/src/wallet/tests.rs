@@ -1,4 +1,4 @@
-use super::SqliteWalletReadRepository;
+use super::{replace_matching_plan_entitlements_sqlite, SqliteWalletReadRepository};
 use crate::run_migrations;
 use aether_data_contracts::repository::wallet::{
     AdjustWalletBalanceInput, AdminPaymentOrderListQuery, AdminRedeemCodeListQuery,
@@ -1090,6 +1090,150 @@ INSERT INTO billing_plans (
         .await
         .expect("high entitlement count should query");
     assert_eq!(active_high_count, 1);
+}
+
+#[tokio::test]
+async fn sqlite_plan_replacement_stacks_usage_policies_unless_groups_match() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+
+    let repository = SqliteWalletReadRepository::new(pool);
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(repository.pool())
+        .await
+        .expect("foreign keys should be disabled for isolated replacement fixtures");
+
+    let fixtures = [
+        (
+            "usage-plain",
+            json!([{"type": "usage_policy", "policy_id": "weekly", "rules": []}]),
+        ),
+        (
+            "usage-pro",
+            json!([{
+                "type": "usage_policy",
+                "replacement_group": "pro-tier",
+                "rules": []
+            }]),
+        ),
+        (
+            "usage-team",
+            json!([{
+                "type": "usage_policy",
+                "replacement_group": "team-tier",
+                "rules": []
+            }]),
+        ),
+        (
+            "daily-legacy",
+            json!([{"type": "daily_quota", "daily_quota_usd": 10.0}]),
+        ),
+    ];
+    for (id, entitlements) in fixtures {
+        sqlx::query(
+            r#"
+INSERT INTO user_plan_entitlements (
+  id, user_id, plan_id, payment_order_id, status, starts_at, expires_at,
+  entitlements_snapshot, created_at, updated_at
+) VALUES (?, 'replacement-user', ?, ?, 'active', 1, 4102444800, ?, 1, 1)
+            "#,
+        )
+        .bind(id)
+        .bind(format!("plan-{id}"))
+        .bind(format!("order-{id}"))
+        .bind(entitlements.to_string())
+        .execute(repository.pool())
+        .await
+        .expect("entitlement fixture should seed");
+    }
+
+    let mut tx = repository.pool().begin().await.expect("tx should start");
+    replace_matching_plan_entitlements_sqlite(
+        &mut tx,
+        "replacement-user",
+        &json!({
+            "entitlements": [{"type": "usage_policy", "policy_id": "five-hour", "rules": []}]
+        }),
+        100,
+    )
+    .await
+    .expect("ungrouped usage policy replacement should run");
+    tx.commit().await.expect("tx should commit");
+    let active_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_plan_entitlements WHERE user_id = ? AND status = 'active'",
+    )
+    .bind("replacement-user")
+    .fetch_one(repository.pool())
+    .await
+    .expect("active entitlement count should query");
+    assert_eq!(active_count, 4);
+
+    let mut tx = repository.pool().begin().await.expect("tx should start");
+    replace_matching_plan_entitlements_sqlite(
+        &mut tx,
+        "replacement-user",
+        &json!({
+            "entitlements": [{
+                "type": "usage_policy",
+                "replacement_group": "pro-tier",
+                "rules": []
+            }]
+        }),
+        200,
+    )
+    .await
+    .expect("grouped usage policy replacement should run");
+    tx.commit().await.expect("tx should commit");
+
+    let statuses = sqlx::query_as::<_, (String, String)>(
+        "SELECT id, status FROM user_plan_entitlements ORDER BY id",
+    )
+    .fetch_all(repository.pool())
+    .await
+    .expect("entitlement statuses should query")
+    .into_iter()
+    .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(
+        statuses.get("usage-pro").map(String::as_str),
+        Some("replaced")
+    );
+    assert_eq!(
+        statuses.get("usage-plain").map(String::as_str),
+        Some("active")
+    );
+    assert_eq!(
+        statuses.get("usage-team").map(String::as_str),
+        Some("active")
+    );
+    assert_eq!(
+        statuses.get("daily-legacy").map(String::as_str),
+        Some("active")
+    );
+
+    let mut tx = repository.pool().begin().await.expect("tx should start");
+    replace_matching_plan_entitlements_sqlite(
+        &mut tx,
+        "replacement-user",
+        &json!({
+            "entitlements": [{"type": "daily_quota", "daily_quota_usd": 50.0}]
+        }),
+        300,
+    )
+    .await
+    .expect("legacy daily quota replacement should run");
+    tx.commit().await.expect("tx should commit");
+    let daily_status: String =
+        sqlx::query_scalar("SELECT status FROM user_plan_entitlements WHERE id = 'daily-legacy'")
+            .fetch_one(repository.pool())
+            .await
+            .expect("daily entitlement status should query");
+    assert_eq!(daily_status, "replaced");
 }
 
 #[tokio::test]

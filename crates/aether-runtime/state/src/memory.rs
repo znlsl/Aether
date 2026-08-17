@@ -6,20 +6,30 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
+use crate::UsageLimitCheck;
 use crate::{DataLayerError, RuntimeQueueEntry, RuntimeQueueReclaimConfig, RuntimeQueueStats};
 
 const MEMORY_RATE_LIMIT_COUNTER_SHARD_COUNT: usize = 64;
 const MEMORY_RATE_LIMIT_COUNTER_PRUNE_INTERVAL: u64 = 256;
+const MEMORY_USAGE_LIMIT_PRUNE_INTERVAL: u64 = 256;
+const DEFAULT_MAX_USAGE_LIMIT_WINDOWS: usize = 10_000;
+const DEFAULT_MAX_USAGE_LIMIT_EVENTS: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryRuntimeStateConfig {
     pub max_kv_entries: usize,
+    /// Maximum number of active sliding-window keys retained by the memory backend.
+    pub max_usage_limit_windows: usize,
+    /// Maximum number of event identities retained across all usage-limit windows.
+    pub max_usage_limit_events: usize,
 }
 
 impl Default for MemoryRuntimeStateConfig {
     fn default() -> Self {
         Self {
             max_kv_entries: 10_000,
+            max_usage_limit_windows: DEFAULT_MAX_USAGE_LIMIT_WINDOWS,
+            max_usage_limit_events: DEFAULT_MAX_USAGE_LIMIT_EVENTS,
         }
     }
 }
@@ -42,6 +52,7 @@ pub(crate) struct MemoryRuntimeBackend {
     config: MemoryRuntimeStateConfig,
     kv: Mutex<HashMap<String, MemoryKvEntry>>,
     counters: MemoryRateLimitCounters,
+    usage_limits: Mutex<MemoryUsageLimitState>,
     sets: Mutex<HashMap<String, MemorySetEntry>>,
     scores: Mutex<HashMap<String, MemoryScoreEntry>>,
     queues: Mutex<HashMap<String, MemoryQueueStream>>,
@@ -49,6 +60,111 @@ pub(crate) struct MemoryRuntimeBackend {
     locks: Mutex<HashMap<String, MemoryLockEntry>>,
     lock_fencing_seq: AtomicU64,
     semaphores: Mutex<HashMap<String, BTreeMap<String, u64>>>,
+}
+
+#[derive(Debug, Clone)]
+struct MemoryUsageLimitWindow {
+    window_ms: u64,
+    expires_at_unix_ms: u64,
+    events: HashMap<String, u64>,
+}
+
+#[derive(Debug, Default)]
+struct MemoryUsageLimitState {
+    windows: HashMap<String, MemoryUsageLimitWindow>,
+    total_events: usize,
+    operations_since_prune: u64,
+    next_expiry_unix_ms: Option<u64>,
+}
+
+impl MemoryUsageLimitState {
+    fn amortized_prune(&mut self, now_unix_ms: u64) {
+        self.operations_since_prune = self.operations_since_prune.saturating_add(1);
+        if self.operations_since_prune < MEMORY_USAGE_LIMIT_PRUNE_INTERVAL {
+            return;
+        }
+        self.operations_since_prune = 0;
+        if self
+            .next_expiry_unix_ms
+            .is_some_and(|expires_at| expires_at <= now_unix_ms)
+        {
+            self.prune_all(now_unix_ms);
+        }
+    }
+
+    fn prune_all(&mut self, now_unix_ms: u64) {
+        self.operations_since_prune = 0;
+        let mut total_events = 0_usize;
+        let mut next_expiry_unix_ms = None;
+        self.windows.retain(|_, window| {
+            if window.expires_at_unix_ms <= now_unix_ms {
+                return false;
+            }
+            prune_usage_limit_events(&mut window.events, now_unix_ms, window.window_ms);
+            if window.events.is_empty() {
+                return false;
+            }
+            total_events = total_events.saturating_add(window.events.len());
+            update_earliest_expiry(&mut next_expiry_unix_ms, window.expires_at_unix_ms);
+            for timestamp in window.events.values() {
+                update_earliest_expiry(
+                    &mut next_expiry_unix_ms,
+                    timestamp.saturating_add(window.window_ms),
+                );
+            }
+            true
+        });
+        self.total_events = total_events;
+        self.next_expiry_unix_ms = next_expiry_unix_ms;
+    }
+
+    fn prune_rule_window(&mut self, key: &str, now_unix_ms: u64, window_ms: u64) {
+        if self
+            .windows
+            .get(key)
+            .is_some_and(|window| window.expires_at_unix_ms <= now_unix_ms)
+        {
+            if let Some(window) = self.windows.remove(key) {
+                self.total_events = self.total_events.saturating_sub(window.events.len());
+            }
+            return;
+        }
+        let Some(window) = self.windows.get_mut(key) else {
+            return;
+        };
+        let before = window.events.len();
+        window.window_ms = window_ms;
+        prune_usage_limit_events(&mut window.events, now_unix_ms, window_ms);
+        self.total_events = self
+            .total_events
+            .saturating_sub(before.saturating_sub(window.events.len()));
+        update_earliest_expiry(&mut self.next_expiry_unix_ms, window.expires_at_unix_ms);
+        for timestamp in window.events.values() {
+            update_earliest_expiry(
+                &mut self.next_expiry_unix_ms,
+                timestamp.saturating_add(window_ms),
+            );
+        }
+        if window.events.is_empty() {
+            self.windows.remove(key);
+        }
+    }
+
+    fn additions_for(&self, input: crate::UsageLimitInput<'_>) -> (usize, usize) {
+        input.rules.iter().fold(
+            (0_usize, 0_usize),
+            |(additional_windows, additional_events), rule| match self.windows.get(rule.key) {
+                Some(window) if window.events.contains_key(input.event_id) => {
+                    (additional_windows, additional_events)
+                }
+                Some(_) => (additional_windows, additional_events.saturating_add(1)),
+                None => (
+                    additional_windows.saturating_add(1),
+                    additional_events.saturating_add(1),
+                ),
+            },
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -500,6 +616,143 @@ impl MemoryRuntimeBackend {
         Ok(crate::RateLimitCheck::Allowed {
             remaining: remaining.unwrap_or(0),
         })
+    }
+
+    pub(crate) async fn check_and_consume_usage_limits(
+        &self,
+        input: crate::UsageLimitInput<'_>,
+    ) -> Result<UsageLimitCheck, DataLayerError> {
+        let mut state = self.usage_limits.lock().await;
+        state.amortized_prune(input.now_unix_ms);
+
+        for (index, rule) in input.rules.iter().enumerate() {
+            let window_ms = rule.window_seconds.saturating_mul(1_000);
+            state.prune_rule_window(rule.key, input.now_unix_ms, window_ms);
+            let Some(window) = state.windows.get(rule.key) else {
+                continue;
+            };
+            if window.events.contains_key(input.event_id) {
+                continue;
+            }
+            if window.events.len() as u64 >= rule.limit {
+                let earliest = window
+                    .events
+                    .values()
+                    .copied()
+                    .min()
+                    .unwrap_or(input.now_unix_ms);
+                let retry_after_ms = earliest
+                    .saturating_add(window_ms)
+                    .saturating_sub(input.now_unix_ms);
+                return Ok(UsageLimitCheck::Rejected {
+                    rule_index: index,
+                    limit: rule.limit,
+                    retry_after: retry_after_ms.saturating_add(999) / 1_000,
+                });
+            }
+        }
+
+        let (mut additional_windows, mut additional_events) = state.additions_for(input);
+        if state.windows.len().saturating_add(additional_windows)
+            > self.config.max_usage_limit_windows
+            || state.total_events.saturating_add(additional_events)
+                > self.config.max_usage_limit_events
+        {
+            // Redis drops an idle sorted-set key after its retention TTL. Force the equivalent full
+            // cleanup before rejecting capacity so stale high-cardinality keys cannot pin memory.
+            if state
+                .next_expiry_unix_ms
+                .is_some_and(|expires_at| expires_at <= input.now_unix_ms)
+            {
+                state.prune_all(input.now_unix_ms);
+            }
+            (additional_windows, additional_events) = state.additions_for(input);
+        }
+        if state.windows.len().saturating_add(additional_windows)
+            > self.config.max_usage_limit_windows
+            || state.total_events.saturating_add(additional_events)
+                > self.config.max_usage_limit_events
+        {
+            return Err(DataLayerError::UnexpectedValue(format!(
+                "runtime memory usage-limit capacity exhausted (windows {}/{}, events {}/{})",
+                state.windows.len(),
+                self.config.max_usage_limit_windows,
+                state.total_events,
+                self.config.max_usage_limit_events,
+            )));
+        }
+
+        for rule in input.rules {
+            let window_ms = rule.window_seconds.saturating_mul(1_000);
+            let expires_at_unix_ms = input
+                .now_unix_ms
+                .saturating_add(rule.retention_seconds.saturating_mul(1_000));
+            let inserted = match state.windows.entry(rule.key.to_string()) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let window = entry.get_mut();
+                    window.window_ms = window_ms;
+                    window.expires_at_unix_ms = expires_at_unix_ms;
+                    match window.events.entry(input.event_id.to_string()) {
+                        std::collections::hash_map::Entry::Occupied(_) => false,
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(input.now_unix_ms);
+                            true
+                        }
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(MemoryUsageLimitWindow {
+                        window_ms,
+                        expires_at_unix_ms,
+                        events: HashMap::from([(input.event_id.to_string(), input.now_unix_ms)]),
+                    });
+                    true
+                }
+            };
+            update_earliest_expiry(&mut state.next_expiry_unix_ms, expires_at_unix_ms);
+            if inserted {
+                state.total_events = state.total_events.saturating_add(1);
+                update_earliest_expiry(
+                    &mut state.next_expiry_unix_ms,
+                    input.now_unix_ms.saturating_add(window_ms),
+                );
+            }
+        }
+        Ok(UsageLimitCheck::Allowed)
+    }
+
+    pub(crate) async fn release_usage_limits(
+        &self,
+        input: crate::UsageLimitReleaseInput<'_>,
+    ) -> Result<(), DataLayerError> {
+        let mut state = self.usage_limits.lock().await;
+        for rule in input.rules {
+            let mut remove_window = false;
+            let mut removed_event = false;
+            if let Some(window) = state.windows.get_mut(rule.key) {
+                removed_event = window.events.remove(input.event_id).is_some();
+                remove_window = window.events.is_empty();
+            }
+            if removed_event {
+                state.total_events = state.total_events.saturating_sub(1);
+            }
+            if remove_window {
+                state.windows.remove(rule.key);
+            }
+        }
+        state.next_expiry_unix_ms = state
+            .windows
+            .values()
+            .flat_map(|window| {
+                std::iter::once(window.expires_at_unix_ms).chain(
+                    window
+                        .events
+                        .values()
+                        .map(|timestamp| timestamp.saturating_add(window.window_ms)),
+                )
+            })
+            .min();
+        Ok(())
     }
 
     pub(crate) fn rate_limit_count(&self, key: &str, bucket: u64) -> Result<u32, DataLayerError> {
@@ -1013,6 +1266,17 @@ impl MemoryRuntimeBackend {
     }
 }
 
+fn prune_usage_limit_events(events: &mut HashMap<String, u64>, now_unix_ms: u64, window_ms: u64) {
+    let Some(cutoff) = now_unix_ms.checked_sub(window_ms) else {
+        return;
+    };
+    events.retain(|_, timestamp| *timestamp > cutoff);
+}
+
+fn update_earliest_expiry(current: &mut Option<u64>, candidate: u64) {
+    *current = Some(current.map_or(candidate, |existing| existing.min(candidate)));
+}
+
 fn get_fresh_locked(
     kv: &mut HashMap<String, MemoryKvEntry>,
     key: &str,
@@ -1196,5 +1460,139 @@ mod tests {
             .expect("rate-limit shard should lock");
         assert!(!shard.entries.contains_key("expired-unrelated-key"));
         assert_eq!(shard.operations_since_prune, 0);
+    }
+
+    #[tokio::test]
+    async fn usage_limit_capacity_is_atomic_and_fail_closed() {
+        let backend = MemoryRuntimeBackend::new(MemoryRuntimeStateConfig {
+            max_usage_limit_windows: 2,
+            max_usage_limit_events: 2,
+            ..MemoryRuntimeStateConfig::default()
+        });
+        let first = [crate::UsageLimitRule {
+            key: "usage:{user-1}:one",
+            limit: 10,
+            window_seconds: 60,
+            retention_seconds: 60,
+        }];
+        backend
+            .check_and_consume_usage_limits(crate::UsageLimitInput {
+                rules: &first,
+                event_id: "event-1",
+                now_unix_ms: 1_000,
+            })
+            .await
+            .expect("first event");
+
+        let two_new_windows = [
+            crate::UsageLimitRule {
+                key: "usage:{user-1}:two",
+                limit: 10,
+                window_seconds: 60,
+                retention_seconds: 60,
+            },
+            crate::UsageLimitRule {
+                key: "usage:{user-1}:three",
+                limit: 10,
+                window_seconds: 60,
+                retention_seconds: 60,
+            },
+        ];
+        let error = backend
+            .check_and_consume_usage_limits(crate::UsageLimitInput {
+                rules: &two_new_windows,
+                event_id: "event-2",
+                now_unix_ms: 2_000,
+            })
+            .await
+            .expect_err("capacity must fail closed");
+        assert!(error.to_string().contains("capacity exhausted"));
+
+        let state = backend.usage_limits.lock().await;
+        assert_eq!(state.windows.len(), 1);
+        assert_eq!(state.total_events, 1);
+        assert!(!state.windows.contains_key(two_new_windows[0].key));
+        assert!(!state.windows.contains_key(two_new_windows[1].key));
+    }
+
+    #[tokio::test]
+    async fn usage_limit_capacity_reclaims_expired_windows_before_rejecting() {
+        let backend = MemoryRuntimeBackend::new(MemoryRuntimeStateConfig {
+            max_usage_limit_windows: 1,
+            max_usage_limit_events: 1,
+            ..MemoryRuntimeStateConfig::default()
+        });
+        let old = [crate::UsageLimitRule {
+            key: "usage:{user-1}:old",
+            limit: 1,
+            window_seconds: 1,
+            retention_seconds: 1,
+        }];
+        backend
+            .check_and_consume_usage_limits(crate::UsageLimitInput {
+                rules: &old,
+                event_id: "event-old",
+                now_unix_ms: 1_000,
+            })
+            .await
+            .expect("old event");
+
+        let current = [crate::UsageLimitRule {
+            key: "usage:{user-1}:current",
+            limit: 1,
+            window_seconds: 1,
+            retention_seconds: 1,
+        }];
+        assert_eq!(
+            backend
+                .check_and_consume_usage_limits(crate::UsageLimitInput {
+                    rules: &current,
+                    event_id: "event-current",
+                    now_unix_ms: 2_000,
+                })
+                .await
+                .expect("expired capacity should be reclaimed"),
+            UsageLimitCheck::Allowed
+        );
+
+        let state = backend.usage_limits.lock().await;
+        assert_eq!(state.windows.len(), 1);
+        assert_eq!(state.total_events, 1);
+        assert!(state.windows.contains_key(current[0].key));
+    }
+
+    #[tokio::test]
+    async fn usage_limit_idempotent_replay_does_not_consume_event_capacity() {
+        let backend = MemoryRuntimeBackend::new(MemoryRuntimeStateConfig {
+            max_usage_limit_windows: 1,
+            max_usage_limit_events: 1,
+            ..MemoryRuntimeStateConfig::default()
+        });
+        let rules = [crate::UsageLimitRule {
+            key: "usage:{user-1}:idempotent",
+            limit: 10,
+            window_seconds: 60,
+            retention_seconds: 60,
+        }];
+        for now_unix_ms in [1_000, 2_000] {
+            assert_eq!(
+                backend
+                    .check_and_consume_usage_limits(crate::UsageLimitInput {
+                        rules: &rules,
+                        event_id: "same-event",
+                        now_unix_ms,
+                    })
+                    .await
+                    .expect("idempotent replay"),
+                UsageLimitCheck::Allowed
+            );
+        }
+
+        let state = backend.usage_limits.lock().await;
+        assert_eq!(state.total_events, 1);
+        assert_eq!(
+            state.windows[rules[0].key].events["same-event"], 1_000,
+            "idempotent replay must preserve the original Redis ZADD NX timestamp"
+        );
     }
 }

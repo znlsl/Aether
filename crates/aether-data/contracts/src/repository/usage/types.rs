@@ -2278,6 +2278,8 @@ pub struct UsageCleanupSummary {
     pub header_cleaned: usize,
     pub keys_cleaned: usize,
     pub records_deleted: usize,
+    pub cost_reservations_deleted: usize,
+    pub request_admissions_deleted: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

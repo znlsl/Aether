@@ -653,7 +653,7 @@ struct ProviderTransferStateTracker {
     exhausted_provider_ids: BTreeSet<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct ProviderTransferTracker {
     state: std::sync::Arc<tokio::sync::Mutex<ProviderTransferStateTracker>>,
     usage_policy_reservation: Option<crate::plan_usage_policy::PlanUsageReservationContext>,
@@ -661,18 +661,6 @@ pub(crate) struct ProviderTransferTracker {
         std::sync::Arc<std::sync::Mutex<Option<aether_contracts::ExecutionPlan>>>,
     usage_policy_cost_reserved: std::sync::Arc<AtomicBool>,
     _background_admission_permit: Option<BackgroundAdmissionPermit>,
-}
-
-impl Default for ProviderTransferTracker {
-    fn default() -> Self {
-        Self {
-            state: Default::default(),
-            usage_policy_reservation: None,
-            usage_policy_reservation_plan: Default::default(),
-            usage_policy_cost_reserved: Default::default(),
-            _background_admission_permit: None,
-        }
-    }
 }
 
 impl ProviderTransferTracker {

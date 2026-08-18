@@ -224,6 +224,14 @@ const AUXILIARY_TABLES: &[AuxiliaryTable] = &[
         primary_key: &["id"],
     },
     AuxiliaryTable {
+        name: "usage_cost_reservations",
+        primary_key: &["reservation_token"],
+    },
+    AuxiliaryTable {
+        name: "usage_request_admissions",
+        primary_key: &["event_token"],
+    },
+    AuxiliaryTable {
         name: "background_task_runs",
         primary_key: &["id"],
     },

@@ -694,6 +694,24 @@ VALUES (
   'request-1', 'candidate-1', 2, 'provider-1',
   'endpoint-1', 'provider-key-1', '1970-01-01T00:00:01Z', '1970-01-01T00:00:02Z'
 );
+INSERT INTO usage_cost_reservations (
+  request_id, subject_id, reservation_token, admitted_at,
+  reserved_cost_units, state, reservation_expires_at, retain_until,
+  created_at, updated_at
+)
+VALUES (
+  'request-1', 'user-1', 'reservation-1', 1,
+  500, 'reserved', 2, 3,
+  1, 1
+);
+INSERT INTO usage_request_admissions (
+  request_id, subject_id, event_token, admitted_at,
+  retain_until, state, created_at
+)
+VALUES (
+  'request-1', 'user-1', 'admission-1', 1,
+  3, 'active', 1
+);
 "#,
         )
         .execute(&pool)
@@ -757,6 +775,19 @@ VALUES (
         .any(|row| row.payload["__table"] == "usage_routing_snapshots"
             && row.payload["candidate_id"] == "candidate-1"
             && row.payload["selected_provider_id"] == "provider-1"));
+    assert!(import_plan
+        .rows(ExportDomain::Auxiliary)
+        .iter()
+        .any(|row| row.payload["__table"] == "usage_cost_reservations"
+            && row.payload["reservation_token"] == "reservation-1"
+            && row.payload["reserved_cost_units"] == 500
+            && row.payload["state"] == "reserved"));
+    assert!(import_plan
+        .rows(ExportDomain::Auxiliary)
+        .iter()
+        .any(|row| row.payload["__table"] == "usage_request_admissions"
+            && row.payload["event_token"] == "admission-1"
+            && row.payload["state"] == "active"));
 
     let target_pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
@@ -769,7 +800,7 @@ VALUES (
     let imported = import_sqlite_jsonl(&target_pool, &encoded)
         .await
         .expect("sqlite import should load exported rows");
-    assert_eq!(imported, 20);
+    assert_eq!(imported, 22);
 
     let imported_api_key =
         sqlx::query_as::<_, (String,)>("SELECT key_encrypted FROM api_keys WHERE id = 'api-key-1'")
@@ -844,6 +875,36 @@ WHERE request_id = 'request-1'
         ("candidate-1".to_string(), 2, "provider-1".to_string())
     );
 
+    let imported_reservation = sqlx::query_as::<_, (String, i64, String)>(
+        r#"
+SELECT subject_id, reserved_cost_units, state
+FROM usage_cost_reservations
+WHERE reservation_token = 'reservation-1'
+"#,
+    )
+    .fetch_one(&target_pool)
+    .await
+    .expect("imported usage cost reservation should load");
+    assert_eq!(
+        imported_reservation,
+        ("user-1".to_string(), 500, "reserved".to_string())
+    );
+
+    let imported_admission = sqlx::query_as::<_, (String, String, Option<i64>)>(
+        r#"
+SELECT subject_id, state, released_at
+FROM usage_request_admissions
+WHERE event_token = 'admission-1'
+"#,
+    )
+    .fetch_one(&target_pool)
+    .await
+    .expect("imported usage request admission should load");
+    assert_eq!(
+        imported_admission,
+        ("user-1".to_string(), "active".to_string(), None)
+    );
+
     if let Some(database_url) = std::env::var("AETHER_TEST_POSTGRES_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -869,7 +930,7 @@ WHERE request_id = 'request-1'
         let imported = import_postgres_jsonl(&postgres_pool, &encoded)
             .await
             .expect("postgres import should load exported rows");
-        assert_eq!(imported, 20);
+        assert_eq!(imported, 22);
 
         let imported_api_key = sqlx::query_as::<_, (String,)>(
             "SELECT key_encrypted FROM api_keys WHERE id = 'api-key-1'",

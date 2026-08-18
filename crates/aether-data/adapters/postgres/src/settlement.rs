@@ -276,7 +276,7 @@ FOR UPDATE
 async fn lock_usage_policy_subject_postgres(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     subject_id: &str,
-) -> Result<(), DataLayerError> {
+) -> Result<bool, DataLayerError> {
     let exists = sqlx::query_scalar::<_, String>(
         r#"
 SELECT id
@@ -290,12 +290,11 @@ FOR UPDATE
     .await
     .map_postgres_err()?
     .is_some();
-    if !exists {
-        return Err(DataLayerError::InvalidInput(
-            "usage policy subject does not exist".to_string(),
-        ));
-    }
-    Ok(())
+    Ok(exists)
+}
+
+fn usage_policy_subject_missing() -> DataLayerError {
+    DataLayerError::InvalidInput("usage policy subject does not exist".to_string())
 }
 
 fn settlement_from_row(
@@ -583,7 +582,9 @@ impl SettlementWriteRepository for SqlxSettlementRepository {
         self.tx_runner
             .run_read_write(|tx| {
                 Box::pin(async move {
-                    lock_usage_policy_subject_postgres(tx, &input.subject_id).await?;
+                    if !lock_usage_policy_subject_postgres(tx, &input.subject_id).await? {
+                        return Err(usage_policy_subject_missing());
+                    }
                     let existing_row =
                         sqlx::query(FIND_USAGE_POLICY_REQUEST_ADMISSION_POSTGRES_SQL)
                             .bind(&input.event_token)
@@ -734,7 +735,9 @@ ON CONFLICT (event_token) DO NOTHING
         self.tx_runner
             .run_read_write(|tx| {
                 Box::pin(async move {
-                    lock_usage_policy_subject_postgres(tx, &input.subject_id).await?;
+                    if !lock_usage_policy_subject_postgres(tx, &input.subject_id).await? {
+                        return Ok(None);
+                    }
                     let row = sqlx::query(FIND_USAGE_POLICY_REQUEST_ADMISSION_POSTGRES_SQL)
                         .bind(&input.event_token)
                         .fetch_optional(&mut **tx)
@@ -818,7 +821,9 @@ WHERE retain_until <= TO_TIMESTAMP($1::double precision)
         self.tx_runner
             .run_read_write(|tx| {
                 Box::pin(async move {
-                    lock_usage_policy_subject_postgres(tx, &input.subject_id).await?;
+                    if !lock_usage_policy_subject_postgres(tx, &input.subject_id).await? {
+                        return Err(usage_policy_subject_missing());
+                    }
                     let existing_row = sqlx::query(FIND_USAGE_POLICY_COST_RESERVATION_POSTGRES_SQL)
                         .bind(&input.reservation_token)
                         .fetch_optional(&mut **tx)
@@ -970,7 +975,9 @@ ON CONFLICT (reservation_token) DO UPDATE SET
         self.tx_runner
             .run_read_write(|tx| {
                 Box::pin(async move {
-                    lock_usage_policy_subject_postgres(tx, &input.subject_id).await?;
+                    if !lock_usage_policy_subject_postgres(tx, &input.subject_id).await? {
+                        return Ok(None);
+                    }
                     let row = sqlx::query(FIND_USAGE_POLICY_COST_RESERVATION_POSTGRES_SQL)
                         .bind(&input.reservation_token)
                         .fetch_optional(&mut **tx)

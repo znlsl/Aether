@@ -33,6 +33,7 @@ pub(crate) enum GatewayError {
         status: StatusCode,
         message: String,
     },
+    PlanUsageLimited(crate::plan_usage_policy::PlanUsagePolicyRejection),
     Internal(String),
 }
 
@@ -43,6 +44,10 @@ impl GatewayError {
             | Self::ControlUnavailable { message, .. }
             | Self::Client { message, .. }
             | Self::Internal(message) => message,
+            Self::PlanUsageLimited(rejection) => format!(
+                "subscription plan {} limit {} reached for {} window; retry after {} seconds",
+                rejection.metric, rejection.limit, rejection.window, rejection.retry_after
+            ),
             Self::LocalExecutionPlanningTimeout {
                 phase, timeout_ms, ..
             } => {
@@ -158,6 +163,22 @@ impl IntoResponse for GatewayError {
                 Json(json!({
                     "error": {
                         "message": message,
+                    }
+                })),
+            )
+                .into_response(),
+            Self::PlanUsageLimited(rejection) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": {
+                        "type": "plan_usage_limit_exceeded",
+                        "message": "套餐使用限制已达到上限，请稍后重试",
+                        "details": {
+                            "metric": rejection.metric,
+                            "window": rejection.window,
+                            "limit": rejection.limit,
+                            "retry_after": rejection.retry_after,
+                        }
                     }
                 })),
             )

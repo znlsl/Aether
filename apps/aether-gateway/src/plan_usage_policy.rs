@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aether_data_contracts::repository::billing::{
@@ -28,18 +29,95 @@ const COST_RESERVATION_TTL_SECS: u64 = 24 * 60 * 60;
 const COST_RESERVATION_SAFE_HISTORY_SECS: u64 = 32 * 24 * 60 * 60;
 
 #[derive(Debug, Clone)]
-pub(crate) struct PlanUsageReservationContext {
+pub(crate) struct PlanUsagePolicySnapshot {
     pub(crate) admitted_at_unix_secs: u64,
-    pub(crate) token: String,
+    subject_id: Arc<str>,
+    policy: Arc<EffectivePlanUsagePolicy>,
+}
+
+impl PlanUsagePolicySnapshot {
+    fn for_admission(
+        subject_id: &str,
+        policy: EffectivePlanUsagePolicy,
+        admitted_at_unix_secs: u64,
+    ) -> Option<Self> {
+        if policy.cost_rules.is_empty() {
+            return None;
+        }
+        Some(Self {
+            admitted_at_unix_secs,
+            subject_id: subject_id.to_string().into(),
+            policy: Arc::new(policy),
+        })
+    }
+
+    pub(crate) fn new_reservation_context(&self) -> PlanUsageReservationContext {
+        PlanUsageReservationContext {
+            policy_snapshot: self.clone(),
+            token: uuid::Uuid::new_v4().to_string().into(),
+        }
+    }
+
+    pub(crate) fn subject_id(&self) -> &str {
+        self.subject_id.as_ref()
+    }
+
+    pub(crate) fn policy(&self) -> &EffectivePlanUsagePolicy {
+        self.policy.as_ref()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PlanUsageReservationContext {
+    policy_snapshot: PlanUsagePolicySnapshot,
+    token: Arc<str>,
 }
 
 impl PlanUsageReservationContext {
-    pub(crate) fn new(token: String, admitted_at_unix_secs: u64) -> Self {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        subject_id: impl Into<Arc<str>>,
+        token: impl Into<Arc<str>>,
+        admitted_at_unix_secs: u64,
+        policy: EffectivePlanUsagePolicy,
+    ) -> Self {
         Self {
-            admitted_at_unix_secs,
-            token,
+            policy_snapshot: PlanUsagePolicySnapshot {
+                admitted_at_unix_secs,
+                subject_id: subject_id.into(),
+                policy: Arc::new(policy),
+            },
+            token: token.into(),
         }
     }
+
+    pub(crate) fn subject_id(&self) -> &str {
+        self.policy_snapshot.subject_id()
+    }
+
+    pub(crate) fn token(&self) -> &str {
+        self.token.as_ref()
+    }
+
+    pub(crate) fn policy(&self) -> &EffectivePlanUsagePolicy {
+        self.policy_snapshot.policy()
+    }
+
+    pub(crate) const fn admitted_at_unix_secs(&self) -> u64 {
+        self.policy_snapshot.admitted_at_unix_secs
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct HttpPlanUsageAdmission {
+    pub(crate) permit: Option<AdmissionPermit>,
+    pub(crate) reservation_context: Option<PlanUsageReservationContext>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PlanUsageAdmission {
+    pub(crate) permit: Option<AdmissionPermit>,
+    pub(crate) policy_snapshot: Option<PlanUsagePolicySnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -107,26 +185,90 @@ pub(crate) enum PlanUsageCostReservationOutcome {
     Rejected(PlanUsagePolicyRejection),
 }
 
-pub(crate) async fn reserve_plan_usage_policy_cost(
+pub(crate) async fn reserve_admitted_http_plan_usage_policy_cost(
     state: &AppState,
     decision: &GatewayControlDecision,
     plan: &aether_contracts::ExecutionPlan,
     report_context: Option<&serde_json::Value>,
+    reservation: Option<&PlanUsageReservationContext>,
+) -> Result<PlanUsageCostReservationOutcome, GatewayError> {
+    let Some(auth) = plan_usage_auth_context(decision) else {
+        return Ok(PlanUsageCostReservationOutcome::NotRequired);
+    };
+    let Some(reservation) = reservation else {
+        return Ok(PlanUsageCostReservationOutcome::NotRequired);
+    };
+    if reservation.subject_id() != auth.user_id {
+        return Err(GatewayError::Internal(
+            "plan usage reservation subject does not match the admitted request".to_string(),
+        ));
+    }
+    reserve_plan_usage_policy_cost_with_policy(
+        state,
+        decision,
+        plan,
+        report_context,
+        reservation.policy(),
+        reservation.admitted_at_unix_secs(),
+        reservation.token(),
+    )
+    .await
+}
+
+pub(crate) async fn reserve_admitted_plan_usage_policy_cost(
+    state: &AppState,
+    decision: &GatewayControlDecision,
+    plan: &aether_contracts::ExecutionPlan,
+    report_context: Option<&serde_json::Value>,
+    snapshot: Option<&PlanUsagePolicySnapshot>,
+    reservation_token: &str,
+) -> Result<PlanUsageCostReservationOutcome, GatewayError> {
+    let Some(auth) = plan_usage_auth_context(decision) else {
+        return Ok(PlanUsageCostReservationOutcome::NotRequired);
+    };
+    let Some(snapshot) = snapshot else {
+        return Ok(PlanUsageCostReservationOutcome::NotRequired);
+    };
+    if snapshot.subject_id() != auth.user_id {
+        return Err(GatewayError::Internal(
+            "plan usage reservation subject does not match the admitted request".to_string(),
+        ));
+    }
+    reserve_plan_usage_policy_cost_with_policy(
+        state,
+        decision,
+        plan,
+        report_context,
+        snapshot.policy(),
+        snapshot.admitted_at_unix_secs,
+        reservation_token,
+    )
+    .await
+}
+
+fn plan_usage_auth_context(
+    decision: &GatewayControlDecision,
+) -> Option<&crate::control::GatewayControlAuthContext> {
+    decision.auth_context.as_ref().filter(|auth| {
+        decision.route_class.as_deref() == Some("ai_public")
+            && !auth.admin_bypass_limits
+            && !auth.api_key_is_standalone
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reserve_plan_usage_policy_cost_with_policy(
+    state: &AppState,
+    decision: &GatewayControlDecision,
+    plan: &aether_contracts::ExecutionPlan,
+    report_context: Option<&serde_json::Value>,
+    policy: &EffectivePlanUsagePolicy,
     admitted_at_unix_secs: u64,
     reservation_token: &str,
 ) -> Result<PlanUsageCostReservationOutcome, GatewayError> {
-    let Some(auth) = decision
-        .auth_context
-        .as_ref()
-        .filter(|_| decision.route_class.as_deref() == Some("ai_public"))
-    else {
+    let Some(auth) = plan_usage_auth_context(decision) else {
         return Ok(PlanUsageCostReservationOutcome::NotRequired);
     };
-    if auth.admin_bypass_limits || auth.api_key_is_standalone {
-        return Ok(PlanUsageCostReservationOutcome::NotRequired);
-    }
-
-    let policy = load_effective_policy(state, &auth.user_id, admitted_at_unix_secs).await?;
     if policy.cost_rules.is_empty() {
         return Ok(PlanUsageCostReservationOutcome::NotRequired);
     }
@@ -292,27 +434,58 @@ impl From<GatewayError> for PlanUsageAdmissionError {
     }
 }
 
-pub(crate) async fn check_and_acquire_plan_usage_policy(
+pub(crate) async fn check_and_acquire_plan_usage_policy_admission(
     state: &AppState,
     decision: Option<&GatewayControlDecision>,
     event_id: &str,
     now_unix_ms: u64,
-) -> Result<Option<AdmissionPermit>, PlanUsageAdmissionError> {
+) -> Result<PlanUsageAdmission, PlanUsageAdmissionError> {
     let Some(auth) = decision
         .filter(|decision| decision.route_class.as_deref() == Some("ai_public"))
         .and_then(|decision| decision.auth_context.as_ref())
     else {
-        return Ok(None);
+        return Ok(PlanUsageAdmission {
+            permit: None,
+            policy_snapshot: None,
+        });
     };
     if auth.admin_bypass_limits || auth.api_key_is_standalone {
+        return Ok(PlanUsageAdmission {
+            permit: None,
+            policy_snapshot: None,
+        });
+    }
+
+    let admitted_at_unix_secs = now_unix_ms / 1_000;
+    let policy = load_effective_policy(state, &auth.user_id, admitted_at_unix_secs).await?;
+    let permit = check_and_acquire_compiled_plan_usage_policy(
+        state,
+        &auth.user_id,
+        &policy,
+        event_id,
+        now_unix_ms,
+    )
+    .await?;
+    let policy_snapshot =
+        PlanUsagePolicySnapshot::for_admission(&auth.user_id, policy, admitted_at_unix_secs);
+    Ok(PlanUsageAdmission {
+        permit,
+        policy_snapshot,
+    })
+}
+
+async fn check_and_acquire_compiled_plan_usage_policy(
+    state: &AppState,
+    subject_id: &str,
+    policy: &EffectivePlanUsagePolicy,
+    event_id: &str,
+    now_unix_ms: u64,
+) -> Result<Option<AdmissionPermit>, PlanUsageAdmissionError> {
+    if policy.request_rules.is_empty() && policy.concurrency_limit.is_none() {
         return Ok(None);
     }
 
     let now_unix_secs = now_unix_ms / 1_000;
-    let policy = load_effective_policy(state, &auth.user_id, now_unix_secs).await?;
-    if policy.request_rules.is_empty() && policy.concurrency_limit.is_none() {
-        return Ok(None);
-    }
 
     let plan_permit = if let Some(limit) = policy.concurrency_limit {
         let limit = usize::try_from(limit).map_err(|_| {
@@ -324,7 +497,7 @@ pub(crate) async fn check_and_acquire_plan_usage_policy(
             .runtime_state
             .keyed_semaphore(
                 CONCURRENCY_GATE,
-                format!("admission:{CONCURRENCY_GATE}:user:{{{}}}", auth.user_id),
+                format!("admission:{CONCURRENCY_GATE}:user:{{{subject_id}}}"),
                 limit,
                 RuntimeSemaphoreConfig::default(),
             )
@@ -344,7 +517,7 @@ pub(crate) async fn check_and_acquire_plan_usage_policy(
         .partition(|rule| request_rule_uses_runtime_state(rule));
     let runtime_rules = runtime_request_rules
         .iter()
-        .map(|rule| runtime_request_rule(&auth.user_id, rule, now_unix_secs))
+        .map(|rule| runtime_request_rule(subject_id, rule, now_unix_secs))
         .collect::<Result<Vec<_>, _>>()?;
     let runtime_inputs = runtime_rules
         .iter()
@@ -412,7 +585,7 @@ pub(crate) async fn check_and_acquire_plan_usage_policy(
             .data
             .reserve_usage_policy_request(ReserveUsagePolicyRequestInput {
                 request_id: event_id.to_string(),
-                subject_id: auth.user_id.clone(),
+                subject_id: subject_id.to_string(),
                 event_token: event_id.to_string(),
                 admitted_at_unix_secs: now_unix_secs,
                 retain_until_unix_secs,
@@ -506,6 +679,47 @@ pub(crate) async fn check_and_acquire_plan_usage_policy(
     }
 
     Ok(AdmissionPermit::from_parts(None, plan_permit))
+}
+
+pub(crate) async fn check_and_acquire_http_plan_usage_policy(
+    state: &AppState,
+    decision: Option<&GatewayControlDecision>,
+    event_id: &str,
+    now_unix_ms: u64,
+) -> Result<HttpPlanUsageAdmission, PlanUsageAdmissionError> {
+    let Some(auth) = decision
+        .filter(|decision| decision.route_class.as_deref() == Some("ai_public"))
+        .and_then(|decision| decision.auth_context.as_ref())
+    else {
+        return Ok(HttpPlanUsageAdmission {
+            permit: None,
+            reservation_context: None,
+        });
+    };
+    if auth.admin_bypass_limits || auth.api_key_is_standalone {
+        return Ok(HttpPlanUsageAdmission {
+            permit: None,
+            reservation_context: None,
+        });
+    }
+
+    let admitted_at_unix_secs = now_unix_ms / 1_000;
+    let policy = load_effective_policy(state, &auth.user_id, admitted_at_unix_secs).await?;
+    let permit = check_and_acquire_compiled_plan_usage_policy(
+        state,
+        &auth.user_id,
+        &policy,
+        event_id,
+        now_unix_ms,
+    )
+    .await?;
+    let reservation_context =
+        PlanUsagePolicySnapshot::for_admission(&auth.user_id, policy, admitted_at_unix_secs)
+            .map(|snapshot| snapshot.new_reservation_context());
+    Ok(HttpPlanUsageAdmission {
+        permit,
+        reservation_context,
+    })
 }
 
 fn request_rule_uses_runtime_state(rule: &&EffectiveRequestRule) -> bool {
@@ -1049,6 +1263,82 @@ mod tests {
         .expect("policy");
         assert_eq!(policy.request_rules.len(), 2);
         assert_eq!(policy.concurrency_limit, Some(4));
+    }
+
+    #[test]
+    fn policy_snapshot_exists_only_for_cost_rules_and_derives_unique_tokens() {
+        assert!(PlanUsagePolicySnapshot::for_admission(
+            "user-1",
+            EffectivePlanUsagePolicy::default(),
+            2_000,
+        )
+        .is_none());
+
+        let policy = compile_effective_policy(
+            &[entitlement(
+                "ent-cost",
+                json!([{"type":"usage_policy","rules":[
+                    {"metric":"actual_cost_usd","window":{"kind":"subscription_period"},"limit":10.0}
+                ]}]),
+            )],
+            2_000,
+        )
+        .expect("cost policy");
+        let snapshot = PlanUsagePolicySnapshot::for_admission("user-1", policy.clone(), 2_000)
+            .expect("cost rules require a policy snapshot");
+        let reservation = snapshot.new_reservation_context();
+        let retry_reservation = snapshot.new_reservation_context();
+
+        assert_eq!(reservation.subject_id(), "user-1");
+        assert_eq!(reservation.admitted_at_unix_secs(), 2_000);
+        assert_eq!(reservation.policy(), &policy);
+        assert!(!reservation.token().trim().is_empty());
+        assert_ne!(reservation.token(), retry_reservation.token());
+        assert_eq!(retry_reservation.admitted_at_unix_secs(), 2_000);
+        assert!(std::ptr::eq(
+            reservation.policy(),
+            retry_reservation.policy()
+        ));
+    }
+
+    #[test]
+    fn admitted_cost_snapshot_keeps_original_window_after_entitlement_expiry() {
+        let policy = compile_effective_policy(
+            &[entitlement(
+                "ent-cost",
+                json!([{"type":"usage_policy","rules":[
+                    {"metric":"actual_cost_usd","window":{"kind":"subscription_period"},"limit":10.0}
+                ]}]),
+            )],
+            9_999,
+        )
+        .expect("policy before expiry");
+        let snapshot = PlanUsagePolicySnapshot::for_admission("user-1", policy, 9_999)
+            .expect("cost policy snapshot");
+
+        let rule = snapshot
+            .policy()
+            .cost_rules
+            .first()
+            .expect("snapshotted cost rule");
+        let runtime = runtime_cost_rule(rule, snapshot.admitted_at_unix_secs)
+            .expect("snapshot remains compilable at its admitted timestamp");
+        assert_eq!(runtime.window.starts_at_unix_secs, 1_000);
+        assert_eq!(runtime.window.ends_at_unix_secs, 10_000);
+        assert_eq!(runtime.retry_after, 1);
+
+        assert!(compile_effective_policy(
+            &[entitlement(
+                "ent-cost",
+                json!([{"type":"usage_policy","rules":[
+                    {"metric":"actual_cost_usd","window":{"kind":"subscription_period"},"limit":10.0}
+                ]}]),
+            )],
+            10_000,
+        )
+        .expect("policy at expiry")
+        .cost_rules
+        .is_empty());
     }
 
     #[test]

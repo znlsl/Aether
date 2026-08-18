@@ -16,7 +16,9 @@ use super::ownership::{
 use super::request::{build_planning_parts, planned_response_create_event};
 use super::state::BoundResponsesConnection;
 use super::turn::{prepare_responses_websocket_turn_decision, ResponsesWebSocketTurnOutcome};
-use super::upstream::{bind_responses_upstream, close_bound_upstream};
+use super::upstream::{
+    bind_responses_upstream, close_bound_upstream, ResponsesWebSocketUpstreamBindError,
+};
 use crate::clock::current_unix_secs;
 use crate::handlers::proxy::websocket::ingress::WebSocketRequestContext;
 use crate::handlers::proxy::websocket::session::WEBSOCKET_LOG_TRANSPORT;
@@ -101,9 +103,9 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
     state: &AppState,
     context: &WebSocketRequestContext,
     _previous_settled: PreviousAttemptSettled,
-) -> bool {
+) -> Result<bool, ()> {
     let Some(active) = bound.turn_state.logical_mut() else {
-        return false;
+        return Ok(false);
     };
     if let Some(reason) = active.quota_retry_block_reason() {
         debug!(
@@ -118,7 +120,7 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
             reason,
             "gateway will not transparently replay an unsafe Responses WebSocket turn"
         );
-        return false;
+        return Ok(false);
     }
     active.retry_attempted = true;
     active.turn_attempt = active.turn_attempt.saturating_add(1);
@@ -132,11 +134,13 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
             trace_id = %context.trace_id,
             "gateway refused to retry a WebSocket turn without its live authorization snapshot"
         );
-        return false;
+        return Ok(false);
     };
     let turn_index = active.turn_index;
     let logical_turn_id = active.logical_turn_id.clone();
     let turn_attempt = active.turn_attempt;
+    let plan_usage_permit = active.plan_usage_permit.clone();
+    let plan_usage_policy_snapshot = active.plan_usage_policy_snapshot.clone();
 
     let retry_exclusion_until_unix_secs = bound
         .pending_adapter_drain
@@ -176,7 +180,7 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
                 exhausted_key_id = ?exhausted_key_id,
                 "gateway could not find an alternate Responses WebSocket provider after quota exhaustion"
             );
-            return false;
+            return Ok(false);
         }
         Err(error) => {
             warn!(
@@ -189,7 +193,7 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
                 error = ?error,
                 "gateway could not plan an alternate Responses WebSocket provider after quota exhaustion"
             );
-            return false;
+            return Ok(false);
         }
     };
     let OwnedResponsesWebSocketDecision {
@@ -211,7 +215,7 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
             key_id = ?decision.key_id,
             "gateway rejected an alternate Responses WebSocket plan that reused the exhausted key"
         );
-        return false;
+        return Ok(false);
     }
     let provider_event = match planned_response_create_event(&decision, &client_event).and_then(
         |event| {
@@ -231,7 +235,7 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
                 error_code = code,
                 "gateway could not rebuild a Responses response.create for transparent quota retry"
             );
-            return false;
+            return Ok(false);
         }
     };
     let turn_decision = prepare_responses_websocket_turn_decision(
@@ -252,6 +256,7 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
         &turn_control.decision,
         turn_decision,
         &client_event,
+        plan_usage_policy_snapshot,
         planned_lease,
     )
     .await
@@ -267,7 +272,7 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
                 error = ?error,
                 "gateway could not start usage and audit tracking for transparent quota retry"
             );
-            return false;
+            return Ok(false);
         }
     };
     let mut replacement = match bind_responses_upstream(
@@ -275,11 +280,41 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
         normalization,
         &client_event,
         adapter,
+        plan_usage_permit.as_ref(),
+        |state| turn.record_upstream_request_state(state),
     )
     .await
     {
         Ok(connection) => connection,
-        Err(code) => {
+        Err(ResponsesWebSocketUpstreamBindError::PlanUsagePermitLost) => {
+            turn.release_plan_usage_cost_before_upstream_send(
+                state,
+                "transparent_retry_plan_usage_permit_lost",
+            )
+            .await;
+            queue_turn_finalization(
+                bound,
+                state,
+                turn,
+                ResponsesWebSocketTurnOutcome::connection_admission_lost(),
+            )
+            .await;
+            warn!(
+                event_name = "responses_websocket_quota_retry_plan_usage_concurrency_lost",
+                log_type = "ops",
+                transport = WEBSOCKET_LOG_TRANSPORT,
+                websocket = true,
+                trace_id = %context.trace_id,
+                "gateway stopped a transparent Responses WebSocket retry before its upstream send after the subscription plan concurrency lease became unhealthy"
+            );
+            return Err(());
+        }
+        Err(ResponsesWebSocketUpstreamBindError::Transport(code)) => {
+            turn.release_plan_usage_cost_before_upstream_send(
+                state,
+                "transparent_retry_rebind_failed",
+            )
+            .await;
             queue_turn_finalization(
                 bound,
                 state,
@@ -296,11 +331,10 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
                 error_code = code,
                 "gateway could not bind an alternate Responses WebSocket provider after quota exhaustion"
             );
-            return false;
+            return Ok(false);
         }
     };
 
-    turn.mark_upstream_request_sent();
     turn.set_provider_response_headers(replacement.upstream_response_headers.clone());
     let replacement_upstream = replacement
         .upstream
@@ -320,8 +354,15 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
     // drop guard 结算并让调用方走「透明重试失败」分支，不静默丢弃一条已经写了
     // pending usage 行、占着 candidate 和 pool key lease 的 attempt。
     if let Err(orphan) = bound.turn_state.resume(turn) {
+        let mut orphan = orphan;
+        orphan
+            .release_plan_usage_cost_before_upstream_send(
+                state,
+                "transparent_retry_state_handoff_failed",
+            )
+            .await;
         drop(orphan);
-        return false;
+        return Ok(false);
     }
     bound.upstream_response_headers = replacement.upstream_response_headers;
     bound.pending_adapter_drain = None;
@@ -338,7 +379,7 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
         key_id = ?bound.decision_template.key_id,
         "gateway transparently rebound a Responses WebSocket turn after quota exhaustion"
     );
-    true
+    Ok(true)
 }
 
 pub(super) fn is_usage_limit_error_event(event: &Value) -> bool {

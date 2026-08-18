@@ -231,7 +231,7 @@ FOR UPDATE
 async fn lock_usage_policy_subject_mysql(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     subject_id: &str,
-) -> Result<(), DataLayerError> {
+) -> Result<bool, DataLayerError> {
     let exists = sqlx::query_scalar::<_, String>(
         r#"
 SELECT id
@@ -245,12 +245,11 @@ FOR UPDATE
     .await
     .map_sql_err()?
     .is_some();
-    if !exists {
-        return Err(DataLayerError::InvalidInput(
-            "usage policy subject does not exist".to_string(),
-        ));
-    }
-    Ok(())
+    Ok(exists)
+}
+
+fn usage_policy_subject_missing() -> DataLayerError {
+    DataLayerError::InvalidInput("usage policy subject does not exist".to_string())
 }
 
 fn settlement_from_row(row: &MySqlRow) -> Result<StoredUsageSettlement, DataLayerError> {
@@ -535,7 +534,9 @@ impl SettlementWriteRepository for MysqlSettlementRepository {
             .await
             .map_sql_err()?;
         let mut tx = connection.begin().await.map_sql_err()?;
-        lock_usage_policy_subject_mysql(&mut tx, &input.subject_id).await?;
+        if !lock_usage_policy_subject_mysql(&mut tx, &input.subject_id).await? {
+            return Err(usage_policy_subject_missing());
+        }
 
         let existing_row = sqlx::query(FIND_USAGE_POLICY_REQUEST_ADMISSION_MYSQL_SQL)
             .bind(&input.event_token)
@@ -671,7 +672,10 @@ ON DUPLICATE KEY UPDATE event_token = VALUES(event_token)
             "usage policy request released_at",
         )?;
         let mut tx = self.pool.begin().await.map_sql_err()?;
-        lock_usage_policy_subject_mysql(&mut tx, &input.subject_id).await?;
+        if !lock_usage_policy_subject_mysql(&mut tx, &input.subject_id).await? {
+            tx.commit().await.map_sql_err()?;
+            return Ok(None);
+        }
         let row = sqlx::query(FIND_USAGE_POLICY_REQUEST_ADMISSION_MYSQL_SQL)
             .bind(&input.event_token)
             .fetch_optional(&mut *tx)
@@ -747,7 +751,9 @@ LIMIT ?
         let updated_at = now_unix_secs()?;
 
         let mut tx = self.pool.begin().await.map_sql_err()?;
-        lock_usage_policy_subject_mysql(&mut tx, &input.subject_id).await?;
+        if !lock_usage_policy_subject_mysql(&mut tx, &input.subject_id).await? {
+            return Err(usage_policy_subject_missing());
+        }
         let existing_row = sqlx::query(FIND_USAGE_POLICY_COST_RESERVATION_MYSQL_SQL)
             .bind(&input.reservation_token)
             .fetch_optional(&mut *tx)
@@ -894,7 +900,10 @@ ON DUPLICATE KEY UPDATE
         let updated_at = now_unix_secs()?;
 
         let mut tx = self.pool.begin().await.map_sql_err()?;
-        lock_usage_policy_subject_mysql(&mut tx, &input.subject_id).await?;
+        if !lock_usage_policy_subject_mysql(&mut tx, &input.subject_id).await? {
+            tx.commit().await.map_sql_err()?;
+            return Ok(None);
+        }
         let row = sqlx::query(FIND_USAGE_POLICY_COST_RESERVATION_MYSQL_SQL)
             .bind(&input.reservation_token)
             .fetch_optional(&mut *tx)

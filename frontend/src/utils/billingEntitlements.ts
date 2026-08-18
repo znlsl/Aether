@@ -72,16 +72,31 @@ function formatUsagePolicyRuleLabel(rule: UsagePolicyRule): string {
       if (rule.window.seconds === 60) return `RPM ${limit}`
       return `滚动 ${formatWindowDuration(rule.window.seconds)} ${limit} 次`
     case 'calendar_day':
-      return amount ? `每日 ${amount}` : `每日 ${limit} 次`
+      return `${amount ? `每日 ${amount}` : `每日 ${limit} 次`}${formatCalendarTimezone(rule.window.timezone)}`
     case 'calendar_week':
-      return amount ? `每周 ${amount}` : `每周 ${limit} 次`
+      return `${amount ? `每周 ${amount}` : `每周 ${limit} 次`}${formatCalendarWeek(rule.window.timezone, rule.window.week_start)}`
     case 'calendar_month':
-      return amount ? `每月 ${amount}` : `每月 ${limit} 次`
+      return `${amount ? `每月 ${amount}` : `每月 ${limit} 次`}${formatCalendarTimezone(rule.window.timezone)}`
     case 'subscription_period':
       return amount ? `套餐周期 ${amount}` : `套餐周期 ${limit} 次`
     case 'concurrent':
       return `并发窗口 ${limit} 次`
   }
+}
+
+function formatCalendarTimezone(timezone?: string): string {
+  return `（${timezone?.trim() || '系统时区'}）`
+}
+
+function formatCalendarWeek(timezone?: string, weekStart?: number): string {
+  const weekdays = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
+  const normalizedWeekStart = typeof weekStart === 'number'
+    && Number.isInteger(weekStart)
+    && weekStart >= 1
+    && weekStart <= 7
+    ? weekStart
+    : 1
+  return `（${timezone?.trim() || '系统时区'}，${weekdays[normalizedWeekStart - 1]}开始）`
 }
 
 function formatUsd(limit: number): string {

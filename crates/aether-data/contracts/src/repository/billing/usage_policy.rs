@@ -701,6 +701,28 @@ mod tests {
     }
 
     #[test]
+    fn window_discriminator_requires_kind_instead_of_type() {
+        for window in [
+            json!({"type": "rolling", "seconds": 60}),
+            json!({"seconds": 60}),
+        ] {
+            let entitlements = json!([{
+                "type": "usage_policy",
+                "rules": [{
+                    "metric": "request_count",
+                    "window": window,
+                    "limit": 100
+                }]
+            }]);
+
+            assert!(matches!(
+                parse_usage_policy_entitlements(&entitlements),
+                Err(UsagePolicyParseError::InvalidShape { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn enforces_collection_and_metadata_bounds() {
         let rule = json!({
             "metric": "request_count",

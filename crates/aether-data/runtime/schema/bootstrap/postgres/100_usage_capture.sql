@@ -159,6 +159,10 @@ CREATE TABLE IF NOT EXISTS public.usage_cost_reservations (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT usage_cost_reservations_pkey PRIMARY KEY (reservation_token),
+    CONSTRAINT usage_cost_reservations_subject_id_fkey
+        FOREIGN KEY (subject_id)
+        REFERENCES public.users(id)
+        ON DELETE CASCADE,
     CONSTRAINT usage_cost_reservations_state_check
         CHECK (state IN ('reserved', 'finalized', 'released')),
     CONSTRAINT usage_cost_reservations_reserved_cost_units_check
@@ -199,6 +203,10 @@ CREATE TABLE IF NOT EXISTS public.usage_request_admissions (
     released_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT usage_request_admissions_pkey PRIMARY KEY (event_token),
+    CONSTRAINT usage_request_admissions_subject_id_fkey
+        FOREIGN KEY (subject_id)
+        REFERENCES public.users(id)
+        ON DELETE CASCADE,
     CONSTRAINT usage_request_admissions_retention_check
         CHECK (retain_until > admitted_at),
     CONSTRAINT usage_request_admissions_state_check

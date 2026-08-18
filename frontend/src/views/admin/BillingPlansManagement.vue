@@ -555,7 +555,7 @@
                 {{ purchaseLimitSummaryText }}
               </div>
               <div class="xl:col-span-12 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-200">
-                每日额度和会员权益仍按类型互斥；使用限制默认可叠加，仅同名套餐互斥组会替换旧套餐。旧套餐被替换时，其中的组合权益会整体失效。
+                每日额度和会员权益仍按类型互斥；使用限制套餐默认可同时生效，相同指标与窗口按最严格上限执行。仅同名套餐互斥组会替换旧套餐；替换时组合权益整体失效。
               </div>
             </div>
           </section>
@@ -887,7 +887,7 @@
                       placeholder="pro-tier"
                     />
                     <p class="text-xs leading-5 text-muted-foreground">
-                      同组套餐换购时旧套餐整包失效；留空时此策略本身可叠加，每日额度和会员权益仍按类型互斥。
+                      同组套餐换购时旧套餐整包失效；留空时此策略可与其他策略同时生效，相同指标与窗口按较低上限执行。每日额度和会员权益仍按类型互斥。
                     </p>
                   </div>
                 </div>
@@ -2265,7 +2265,7 @@ function entitlementBadges(plan: BillingPlan): string[] {
     if (entitlement.type === 'usage_policy') {
       return formatUsagePolicyBadge(entitlement)
     }
-    return entitlement.type
+    return '未知权益'
   })
 }
 

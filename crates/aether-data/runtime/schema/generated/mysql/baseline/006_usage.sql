@@ -260,7 +260,8 @@ CREATE TABLE IF NOT EXISTS usage_cost_reservations (
     KEY usage_cost_reservations_request_id_idx (`request_id`),
     KEY usage_cost_reservations_subject_admitted_at_idx (`subject_id`, `admitted_at`),
     KEY usage_cost_reservations_reservation_expires_at_idx (`reservation_expires_at`),
-    KEY usage_cost_reservations_retain_until_token_idx (`retain_until`, `reservation_token`)
+    KEY usage_cost_reservations_retain_until_token_idx (`retain_until`, `reservation_token`),
+    CONSTRAINT usage_cost_reservations_subject_id_fkey FOREIGN KEY (`subject_id`) REFERENCES users (`id`) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS usage_request_admissions (
@@ -274,6 +275,7 @@ CREATE TABLE IF NOT EXISTS usage_request_admissions (
     `created_at` BIGINT NOT NULL,
     PRIMARY KEY (`event_token`),
     KEY usage_request_admissions_subject_admitted_at_idx (`subject_id`, `admitted_at`),
-    KEY usage_request_admissions_retain_until_token_idx (`retain_until`, `event_token`)
+    KEY usage_request_admissions_retain_until_token_idx (`retain_until`, `event_token`),
+    CONSTRAINT usage_request_admissions_subject_id_fkey FOREIGN KEY (`subject_id`) REFERENCES users (`id`) ON DELETE CASCADE
 );
 

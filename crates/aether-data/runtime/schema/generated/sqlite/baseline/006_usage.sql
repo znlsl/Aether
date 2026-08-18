@@ -249,7 +249,8 @@ CREATE TABLE IF NOT EXISTS usage_cost_reservations (
     retain_until INTEGER NOT NULL,
     finalized_at INTEGER,
     created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    CONSTRAINT usage_cost_reservations_subject_id_fkey FOREIGN KEY (subject_id) REFERENCES users (id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS usage_cost_reservations_request_id_idx ON usage_cost_reservations (request_id);
 CREATE INDEX IF NOT EXISTS usage_cost_reservations_subject_admitted_at_idx ON usage_cost_reservations (subject_id, admitted_at);
@@ -264,7 +265,8 @@ CREATE TABLE IF NOT EXISTS usage_request_admissions (
     retain_until INTEGER NOT NULL,
     state TEXT NOT NULL,
     released_at INTEGER,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    CONSTRAINT usage_request_admissions_subject_id_fkey FOREIGN KEY (subject_id) REFERENCES users (id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS usage_request_admissions_subject_admitted_at_idx ON usage_request_admissions (subject_id, admitted_at);
 CREATE INDEX IF NOT EXISTS usage_request_admissions_retain_until_token_idx ON usage_request_admissions (retain_until, event_token);

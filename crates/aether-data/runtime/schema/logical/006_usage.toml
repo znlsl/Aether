@@ -1223,6 +1223,13 @@ columns = ["reservation_expires_at"]
 name = "usage_cost_reservations_retain_until_token_idx"
 columns = ["retain_until", "reservation_token"]
 
+[[table.usage_cost_reservations.foreign_keys]]
+name = "usage_cost_reservations_subject_id_fkey"
+columns = ["subject_id"]
+references_table = "users"
+references_columns = ["id"]
+on_delete = "cascade"
+
 [table.usage_request_admissions]
 domain = "usage"
 order = 22
@@ -1272,3 +1279,10 @@ columns = ["subject_id", "admitted_at"]
 [[table.usage_request_admissions.indexes]]
 name = "usage_request_admissions_retain_until_token_idx"
 columns = ["retain_until", "event_token"]
+
+[[table.usage_request_admissions.foreign_keys]]
+name = "usage_request_admissions_subject_id_fkey"
+columns = ["subject_id"]
+references_table = "users"
+references_columns = ["id"]
+on_delete = "cascade"

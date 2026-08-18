@@ -249,6 +249,23 @@ pub(crate) async fn send_upstream_message(
     bounded_send(RELAY_WRITE_TIMEOUT, upstream.send(message).map_err(|_| ())).await
 }
 
+/// Queues one frame in the upstream sink without flushing it. Completion means
+/// `start_send` succeeded, so callers must conservatively treat the frame as
+/// possibly delivered even when a later flush fails or is cancelled.
+pub(crate) async fn feed_upstream_message(
+    upstream: &mut wreq::ws::WebSocket,
+    message: WreqWsMessage,
+) -> Result<(), WebSocketWriteError> {
+    bounded_send(RELAY_WRITE_TIMEOUT, upstream.feed(message).map_err(|_| ())).await
+}
+
+/// Flushes frames previously queued with [`feed_upstream_message`].
+pub(crate) async fn flush_upstream_messages(
+    upstream: &mut wreq::ws::WebSocket,
+) -> Result<(), WebSocketWriteError> {
+    bounded_send(RELAY_WRITE_TIMEOUT, upstream.flush().map_err(|_| ())).await
+}
+
 /// Best-effort teardown write.  The caller is already ending the session, so
 /// the outcome only matters for keeping the wait bounded.
 async fn send_teardown_message<F>(write: F)

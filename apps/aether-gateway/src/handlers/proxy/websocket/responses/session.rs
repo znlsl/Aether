@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use super::adapter::resolve_responses_websocket_adapter;
 use super::client::consume_response_create_rate_limit;
-use super::connection::{relay_bound_connection, wait_for_connection_permit_loss};
+use super::connection::relay_bound_connection;
 use super::control::resolve_responses_websocket_turn_control;
 use super::lifecycle::{
     await_pending_adapter_observation, await_pending_turn_finalization,
@@ -26,6 +26,11 @@ use super::ownership::{
     await_owned_responses_websocket_plan, begin_responses_websocket_turn_with_planned_lease,
     spawn_owned_responses_websocket_plan, OwnedResponsesWebSocketDecision,
 };
+use super::plan_admission::{
+    acquire_responses_websocket_plan_admission, responses_websocket_plan_admission_close,
+    send_responses_websocket_plan_admission_error,
+    terminate_responses_websocket_for_plan_permit_loss, wait_for_admission_permit_loss,
+};
 use super::redaction::redact_responses_websocket_client_event;
 use super::relay_policy::{fatal_relay_policy, FatalRelaySignal};
 use super::request::{
@@ -34,7 +39,9 @@ use super::request::{
 use super::state::BoundResponsesConnection;
 use super::turn::{prepare_responses_websocket_turn_decision, ResponsesWebSocketTurnOutcome};
 use super::turn_state::LogicalTurn;
-use super::upstream::{bind_responses_upstream, close_bound_upstream};
+use super::upstream::{
+    bind_responses_upstream, close_bound_upstream, ResponsesWebSocketUpstreamBindError,
+};
 
 use crate::handlers::proxy::websocket::ingress::{
     WebSocketConnectionLog, WebSocketConnectionLogSpec, WebSocketRequestContext,
@@ -343,7 +350,7 @@ where
         _ = tokio::time::sleep_until(connection_deadline) => {
             Err(ConnectionTermination::ConnectionLimitReached)
         }
-        _ = wait_for_connection_permit_loss(connection_permit) => {
+        _ = wait_for_admission_permit_loss(connection_permit) => {
             Err(ConnectionTermination::ConnectionAdmissionLost)
         }
         output = &mut phase => Ok(output),
@@ -443,6 +450,37 @@ async fn bootstrap_responses_websocket(
             return None;
         }
     }
+
+    let first_logical_turn_id = Uuid::new_v4().to_string();
+    let plan_usage_admission = match acquire_responses_websocket_plan_admission(
+        &state,
+        &turn_control.decision,
+        &first_logical_turn_id,
+    )
+    .await
+    {
+        Ok(admission) => admission,
+        Err(error) => {
+            warn!(
+                event_name = "responses_websocket_initial_plan_usage_rejected",
+                log_type = "event",
+                transport = WEBSOCKET_LOG_TRANSPORT,
+                websocket = true,
+                trace_id = %context.trace_id,
+                logical_turn_id = %first_logical_turn_id,
+                error = ?error,
+                "gateway rejected the initial Responses WebSocket turn at its subscription plan limit"
+            );
+            send_responses_websocket_plan_admission_error(client_socket, &error).await;
+            let (close_code, close_reason) = responses_websocket_plan_admission_close(&error);
+            close_client_socket(client_socket, close_code, close_reason).await;
+            return None;
+        }
+    };
+    let crate::plan_usage_policy::PlanUsageAdmission {
+        permit: plan_usage_permit,
+        policy_snapshot: plan_usage_policy_snapshot,
+    } = plan_usage_admission;
 
     // 请求侧脱敏必须在规划之前完成，而且这一轮只在这里做一次：planner 会把这份
     // body 写进 upstream 请求体和审计 original_request_body，绑定上游的首条
@@ -576,7 +614,6 @@ async fn bootstrap_responses_websocket(
             return None;
         }
     };
-    let first_logical_turn_id = Uuid::new_v4().to_string();
     let first_turn_decision = prepare_responses_websocket_turn_decision(
         &decision,
         context.trace_id.clone(),
@@ -595,6 +632,7 @@ async fn bootstrap_responses_websocket(
         &turn_control.decision,
         first_turn_decision,
         &first_event,
+        plan_usage_policy_snapshot.clone(),
         planned_lease,
     )
     .await
@@ -617,43 +655,77 @@ async fn bootstrap_responses_websocket(
         }
     };
 
-    let mut bound =
-        match bind_responses_upstream(&decision, normalization, &first_event, adapter).await {
-            Ok(connection) => connection,
-            Err(code) => {
-                let finalizer = finalize_unbound_turn(
-                    state.clone(),
-                    first_turn,
-                    ResponsesWebSocketTurnOutcome::upstream_connect_failed(code),
-                );
-                warn!(
-                    event_name = "responses_websocket_upstream_connect_failed",
-                    log_type = "ops",
-                    transport = WEBSOCKET_LOG_TRANSPORT,
-                    websocket = true,
-                    trace_id = %context.trace_id,
-                    error_code = code,
-                    "gateway failed to establish Responses WebSocket upstream"
-                );
-                send_gateway_error_with_status(
-                    client_socket,
-                    502,
-                    code,
-                    "Gateway could not establish the Provider connection",
+    let mut bound = match bind_responses_upstream(
+        &decision,
+        normalization,
+        &first_event,
+        adapter,
+        plan_usage_permit.as_ref(),
+        |state| first_turn.record_upstream_request_state(state),
+    )
+    .await
+    {
+        Ok(connection) => connection,
+        Err(ResponsesWebSocketUpstreamBindError::PlanUsagePermitLost) => {
+            first_turn
+                .release_plan_usage_cost_before_upstream_send(
+                    &state,
+                    "initial_plan_usage_permit_lost",
                 )
                 .await;
-                close_client_socket(client_socket, CLOSE_TRY_AGAIN, code).await;
-                await_turn_finalization_handle(finalizer).await;
-                return None;
-            }
-        };
-    first_turn.mark_upstream_request_sent();
+            let finalizer = finalize_unbound_turn(
+                state.clone(),
+                first_turn,
+                ResponsesWebSocketTurnOutcome::connection_admission_lost(),
+            );
+            warn!(
+                event_name = "responses_websocket_initial_plan_usage_concurrency_lost",
+                log_type = "ops",
+                transport = WEBSOCKET_LOG_TRANSPORT,
+                websocket = true,
+                trace_id = %context.trace_id,
+                "gateway stopped the initial Responses WebSocket turn before its upstream send after the subscription plan concurrency lease became unhealthy"
+            );
+            terminate_responses_websocket_for_plan_permit_loss(client_socket).await;
+            await_turn_finalization_handle(finalizer).await;
+            return None;
+        }
+        Err(ResponsesWebSocketUpstreamBindError::Transport(code)) => {
+            let finalizer = finalize_unbound_turn(
+                state.clone(),
+                first_turn,
+                ResponsesWebSocketTurnOutcome::upstream_connect_failed(code),
+            );
+            warn!(
+                event_name = "responses_websocket_upstream_connect_failed",
+                log_type = "ops",
+                transport = WEBSOCKET_LOG_TRANSPORT,
+                websocket = true,
+                trace_id = %context.trace_id,
+                error_code = code,
+                "gateway failed to establish Responses WebSocket upstream"
+            );
+            send_gateway_error_with_status(
+                client_socket,
+                502,
+                code,
+                "Gateway could not establish the Provider connection",
+            )
+            .await;
+            close_client_socket(client_socket, CLOSE_TRY_AGAIN, code).await;
+            await_turn_finalization_handle(finalizer).await;
+            return None;
+        }
+    };
     first_turn.set_provider_response_headers(bound.upstream_response_headers.clone());
     if let Some(session) = first_turn_redaction_session {
         bound.redaction_restorer.register(session);
     }
     bound.turn_state.begin(
-        LogicalTurn::new(first_event, 1, first_logical_turn_id).with_turn_control(turn_control),
+        LogicalTurn::new(first_event, 1, first_logical_turn_id)
+            .with_turn_control(turn_control)
+            .with_plan_usage_permit(plan_usage_permit)
+            .with_plan_usage_policy_snapshot(plan_usage_policy_snapshot),
         first_turn,
     );
 
@@ -1507,6 +1579,8 @@ mod tests {
             resolve_responses_websocket_adapter(
                 crate::orchestration::ResponsesWebSocketAdapter::Standard,
             ),
+            None,
+            |_| {},
         )
         .await
         .expect("upstream binding should succeed");

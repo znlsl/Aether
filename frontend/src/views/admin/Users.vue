@@ -573,7 +573,7 @@ function entitlementLabels(items: BillingEntitlement[] | undefined): string[] {
     if (item.type === 'usage_policy') {
       return usagePolicyEntitlementLabels(item)
     }
-    return item.type
+    return []
   })
 }
 

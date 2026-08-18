@@ -240,18 +240,17 @@ WHERE reservation_token = ?
 async fn lock_usage_policy_subject_sqlite(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     subject_id: &str,
-) -> Result<(), DataLayerError> {
+) -> Result<bool, DataLayerError> {
     let result = sqlx::query("UPDATE users SET updated_at = updated_at WHERE id = ?")
         .bind(subject_id)
         .execute(&mut **tx)
         .await
         .map_sql_err()?;
-    if result.rows_affected() == 0 {
-        return Err(DataLayerError::InvalidInput(
-            "usage policy subject does not exist".to_string(),
-        ));
-    }
-    Ok(())
+    Ok(result.rows_affected() > 0)
+}
+
+fn usage_policy_subject_missing() -> DataLayerError {
+    DataLayerError::InvalidInput("usage policy subject does not exist".to_string())
 }
 
 fn settlement_from_row(row: &SqliteRow) -> Result<StoredUsageSettlement, DataLayerError> {
@@ -518,7 +517,9 @@ impl SettlementWriteRepository for SqliteSettlementRepository {
         let now = now_unix_secs()?;
         let mut tx = self.pool.begin().await.map_sql_err()?;
         // This no-op update acquires SQLite's single writer slot before any admission reads.
-        lock_usage_policy_subject_sqlite(&mut tx, &input.subject_id).await?;
+        if !lock_usage_policy_subject_sqlite(&mut tx, &input.subject_id).await? {
+            return Err(usage_policy_subject_missing());
+        }
         let existing_row = sqlx::query(FIND_USAGE_POLICY_REQUEST_ADMISSION_SQLITE_SQL)
             .bind(&input.event_token)
             .fetch_optional(&mut *tx)
@@ -659,7 +660,10 @@ WHERE subject_id = ?
     ) -> Result<Option<StoredUsagePolicyRequestAdmission>, DataLayerError> {
         input.validate()?;
         let mut tx = self.pool.begin().await.map_sql_err()?;
-        lock_usage_policy_subject_sqlite(&mut tx, &input.subject_id).await?;
+        if !lock_usage_policy_subject_sqlite(&mut tx, &input.subject_id).await? {
+            tx.commit().await.map_sql_err()?;
+            return Ok(None);
+        }
         let row = sqlx::query(FIND_USAGE_POLICY_REQUEST_ADMISSION_SQLITE_SQL)
             .bind(&input.event_token)
             .fetch_optional(&mut *tx)
@@ -735,7 +739,9 @@ WHERE rowid IN (
         input.validate()?;
         let now = now_unix_secs()?;
         let mut tx = self.pool.begin().await.map_sql_err()?;
-        lock_usage_policy_subject_sqlite(&mut tx, &input.subject_id).await?;
+        if !lock_usage_policy_subject_sqlite(&mut tx, &input.subject_id).await? {
+            return Err(usage_policy_subject_missing());
+        }
         let existing_row = sqlx::query(FIND_USAGE_POLICY_COST_RESERVATION_SQLITE_SQL)
             .bind(&input.reservation_token)
             .fetch_optional(&mut *tx)
@@ -880,7 +886,10 @@ ON CONFLICT (reservation_token) DO UPDATE SET
         input.validate()?;
         let now = now_unix_secs()?;
         let mut tx = self.pool.begin().await.map_sql_err()?;
-        lock_usage_policy_subject_sqlite(&mut tx, &input.subject_id).await?;
+        if !lock_usage_policy_subject_sqlite(&mut tx, &input.subject_id).await? {
+            tx.commit().await.map_sql_err()?;
+            return Ok(None);
+        }
         let row = sqlx::query(FIND_USAGE_POLICY_COST_RESERVATION_SQLITE_SQL)
             .bind(&input.reservation_token)
             .fetch_optional(&mut *tx)
@@ -1301,10 +1310,14 @@ WHERE id = ?
 #[cfg(test)]
 mod tests {
     use super::{SqliteSettlementRepository, INSERT_USAGE_POLICY_REQUEST_ADMISSION_SQLITE_SQL};
-    use crate::run_migrations;
+    use crate::{run_migrations, SqliteUserReadRepository};
     use aether_data_contracts::repository::settlement::{
-        SettlementWriteRepository, UsageSettlementInput,
+        ReconcileUsagePolicyCostInput, ReleaseUsagePolicyRequestAdmissionInput,
+        ReserveUsagePolicyCostInput, ReserveUsagePolicyRequestInput, SettlementWriteRepository,
+        UsagePolicyCostReservationState, UsagePolicyCostWindow, UsagePolicyRequestWindow,
+        UsageSettlementInput,
     };
+    use aether_data_contracts::repository::users::UserReadRepository;
     use sqlx::Row;
     use std::time::Duration;
 
@@ -1425,6 +1438,17 @@ WHERE request_id = 'request-1'
         run_migrations(&pool)
             .await
             .expect("sqlite migrations should run");
+        sqlx::query(
+            r#"
+INSERT INTO users (id, username, auth_source, created_at, updated_at)
+VALUES
+  ('defensive-user-1', 'defensive-user-1', 'local', 1, 1),
+  ('defensive-user-2', 'defensive-user-2', 'local', 1, 1)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("usage policy subjects should insert");
 
         let insert = |request_id: &'static str, subject_id: &'static str| {
             sqlx::query(INSERT_USAGE_POLICY_REQUEST_ADMISSION_SQLITE_SQL)
@@ -1465,6 +1489,101 @@ WHERE request_id = 'request-1'
                 100,
             )
         );
+    }
+
+    #[tokio::test]
+    async fn deleting_user_cascades_usage_policy_ledgers_and_terminal_calls_are_noops() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        sqlx::query(
+            r#"
+INSERT INTO users (id, username, auth_source, created_at, updated_at)
+VALUES ('usage-policy-delete-user', 'usage-policy-delete-user', 'local', 1, 1)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("usage policy user should insert");
+
+        let repository = SqliteSettlementRepository::new(pool.clone());
+        repository
+            .reserve_usage_policy_request(ReserveUsagePolicyRequestInput {
+                request_id: "usage-policy-delete-request".to_string(),
+                subject_id: "usage-policy-delete-user".to_string(),
+                event_token: "usage-policy-delete-event".to_string(),
+                admitted_at_unix_secs: 100,
+                retain_until_unix_secs: 200,
+                windows: vec![UsagePolicyRequestWindow {
+                    starts_at_unix_secs: 50,
+                    ends_at_unix_secs: 200,
+                    limit_requests: 10,
+                }],
+            })
+            .await
+            .expect("request admission should reserve");
+        repository
+            .reserve_usage_policy_cost(ReserveUsagePolicyCostInput {
+                request_id: "usage-policy-delete-request".to_string(),
+                subject_id: "usage-policy-delete-user".to_string(),
+                reservation_token: "usage-policy-delete-reservation".to_string(),
+                admitted_at_unix_secs: 100,
+                reserved_cost_units: 1,
+                reservation_expires_at_unix_secs: 150,
+                retain_until_unix_secs: 200,
+                windows: vec![UsagePolicyCostWindow {
+                    window_id: "usage-policy-delete-window".to_string(),
+                    starts_at_unix_secs: 50,
+                    ends_at_unix_secs: 200,
+                    limit_cost_units: 10,
+                }],
+            })
+            .await
+            .expect("cost reservation should reserve");
+
+        assert!(SqliteUserReadRepository::new(pool.clone())
+            .delete_local_auth_user("usage-policy-delete-user")
+            .await
+            .expect("user deletion should succeed"));
+        let ledger_count: i64 = sqlx::query_scalar(
+            r#"
+SELECT
+  (SELECT COUNT(*) FROM usage_request_admissions)
+  + (SELECT COUNT(*) FROM usage_cost_reservations)
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("usage policy ledgers should count");
+        assert_eq!(ledger_count, 0);
+
+        assert!(repository
+            .release_usage_policy_request_admission(ReleaseUsagePolicyRequestAdmissionInput {
+                request_id: "usage-policy-delete-request".to_string(),
+                subject_id: "usage-policy-delete-user".to_string(),
+                event_token: "usage-policy-delete-event".to_string(),
+                released_at_unix_secs: 150,
+            },)
+            .await
+            .expect("post-delete release should be a no-op")
+            .is_none());
+        assert!(repository
+            .reconcile_usage_policy_cost(ReconcileUsagePolicyCostInput {
+                request_id: "usage-policy-delete-request".to_string(),
+                subject_id: "usage-policy-delete-user".to_string(),
+                reservation_token: "usage-policy-delete-reservation".to_string(),
+                actual_cost_units: 1,
+                terminal_state: UsagePolicyCostReservationState::Finalized,
+                finalized_at_unix_secs: 150,
+            })
+            .await
+            .expect("post-delete reconciliation should be a no-op")
+            .is_none());
     }
 
     #[tokio::test]

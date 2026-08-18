@@ -269,6 +269,7 @@ CREATE INDEX IF NOT EXISTS usage_cost_reservations_request_id_idx ON public.usag
 CREATE INDEX IF NOT EXISTS usage_cost_reservations_subject_admitted_at_idx ON public.usage_cost_reservations USING btree (subject_id, admitted_at);
 CREATE INDEX IF NOT EXISTS usage_cost_reservations_reservation_expires_at_idx ON public.usage_cost_reservations USING btree (reservation_expires_at);
 CREATE INDEX IF NOT EXISTS usage_cost_reservations_retain_until_token_idx ON public.usage_cost_reservations USING btree (retain_until, reservation_token);
+ALTER TABLE ONLY public.usage_cost_reservations ADD CONSTRAINT usage_cost_reservations_subject_id_fkey FOREIGN KEY (subject_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
 CREATE TABLE IF NOT EXISTS public.usage_request_admissions (
     request_id character varying(128) NOT NULL,
@@ -284,4 +285,5 @@ CREATE TABLE IF NOT EXISTS public.usage_request_admissions (
 ALTER TABLE ONLY public.usage_request_admissions ADD CONSTRAINT usage_request_admissions_pkey PRIMARY KEY (event_token);
 CREATE INDEX IF NOT EXISTS usage_request_admissions_subject_admitted_at_idx ON public.usage_request_admissions USING btree (subject_id, admitted_at);
 CREATE INDEX IF NOT EXISTS usage_request_admissions_retain_until_token_idx ON public.usage_request_admissions USING btree (retain_until, event_token);
+ALTER TABLE ONLY public.usage_request_admissions ADD CONSTRAINT usage_request_admissions_subject_id_fkey FOREIGN KEY (subject_id) REFERENCES public.users(id) ON DELETE CASCADE;
 

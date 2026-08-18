@@ -2,7 +2,7 @@ use async_trait::async_trait;
 
 use crate::repository::billing::MAX_USAGE_POLICY_TOTAL_RULES;
 
-const MAX_USAGE_POLICY_ADMISSION_ID_BYTES: usize = 128;
+const MAX_USAGE_POLICY_LEDGER_ID_BYTES: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsagePolicyRequestWindow {
@@ -156,14 +156,9 @@ pub struct ReserveUsagePolicyCostInput {
 
 impl ReserveUsagePolicyCostInput {
     pub fn validate(&self) -> Result<(), crate::DataLayerError> {
-        validate_non_empty_id(&self.request_id, "usage policy request_id")?;
-        validate_non_empty_id(&self.subject_id, "usage policy subject_id")?;
-        validate_non_empty_id(&self.reservation_token, "usage policy reservation_token")?;
-        if self.reservation_token.len() > 128 {
-            return Err(crate::DataLayerError::InvalidInput(
-                "usage policy reservation_token exceeds 128 bytes".to_string(),
-            ));
-        }
+        validate_bounded_id(&self.request_id, "usage policy request_id")?;
+        validate_bounded_id(&self.subject_id, "usage policy subject_id")?;
+        validate_bounded_id(&self.reservation_token, "usage policy reservation_token")?;
         validate_cost_units(self.reserved_cost_units, "reserved_cost_units")?;
         if self.reservation_expires_at_unix_secs <= self.admitted_at_unix_secs {
             return Err(crate::DataLayerError::InvalidInput(
@@ -269,14 +264,9 @@ pub struct ReconcileUsagePolicyCostInput {
 
 impl ReconcileUsagePolicyCostInput {
     pub fn validate(&self) -> Result<(), crate::DataLayerError> {
-        validate_non_empty_id(&self.request_id, "usage policy request_id")?;
-        validate_non_empty_id(&self.subject_id, "usage policy subject_id")?;
-        validate_non_empty_id(&self.reservation_token, "usage policy reservation_token")?;
-        if self.reservation_token.len() > 128 {
-            return Err(crate::DataLayerError::InvalidInput(
-                "usage policy reservation_token exceeds 128 bytes".to_string(),
-            ));
-        }
+        validate_bounded_id(&self.request_id, "usage policy request_id")?;
+        validate_bounded_id(&self.subject_id, "usage policy subject_id")?;
+        validate_bounded_id(&self.reservation_token, "usage policy reservation_token")?;
         validate_cost_units(self.actual_cost_units, "actual_cost_units")?;
         match self.terminal_state {
             UsagePolicyCostReservationState::Reserved => Err(crate::DataLayerError::InvalidInput(
@@ -318,9 +308,9 @@ fn validate_non_empty_id(value: &str, field: &str) -> Result<(), crate::DataLaye
 
 fn validate_bounded_id(value: &str, field: &str) -> Result<(), crate::DataLayerError> {
     validate_non_empty_id(value, field)?;
-    if value.len() > MAX_USAGE_POLICY_ADMISSION_ID_BYTES {
+    if value.len() > MAX_USAGE_POLICY_LEDGER_ID_BYTES {
         return Err(crate::DataLayerError::InvalidInput(format!(
-            "{field} exceeds {MAX_USAGE_POLICY_ADMISSION_ID_BYTES} bytes"
+            "{field} exceeds {MAX_USAGE_POLICY_LEDGER_ID_BYTES} bytes"
         )));
     }
     Ok(())
@@ -497,7 +487,11 @@ pub fn settlement_billable_cost_usd(input: &UsageSettlementInput) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReserveUsagePolicyRequestInput, UsagePolicyRequestWindow, UsageSettlementInput};
+    use super::{
+        ReconcileUsagePolicyCostInput, ReserveUsagePolicyCostInput, ReserveUsagePolicyRequestInput,
+        UsagePolicyCostReservationState, UsagePolicyCostWindow, UsagePolicyRequestWindow,
+        UsageSettlementInput,
+    };
 
     #[test]
     fn rejects_invalid_settlement_input() {
@@ -539,5 +533,57 @@ mod tests {
         let mut invalid_window = valid;
         invalid_window.windows[0].starts_at_unix_secs = 101;
         assert!(invalid_window.validate().is_err());
+    }
+
+    #[test]
+    fn usage_policy_cost_ids_match_sql_column_bounds() {
+        let bounded = "x".repeat(128);
+        let reserve = ReserveUsagePolicyCostInput {
+            request_id: bounded.clone(),
+            subject_id: bounded.clone(),
+            reservation_token: bounded.clone(),
+            admitted_at_unix_secs: 100,
+            reserved_cost_units: 1,
+            reservation_expires_at_unix_secs: 150,
+            retain_until_unix_secs: 200,
+            windows: vec![UsagePolicyCostWindow {
+                window_id: "window-1".to_string(),
+                starts_at_unix_secs: 50,
+                ends_at_unix_secs: 200,
+                limit_cost_units: 10,
+            }],
+        };
+        assert!(reserve.validate().is_ok());
+
+        for field in ["request_id", "subject_id", "reservation_token"] {
+            let mut too_long = reserve.clone();
+            match field {
+                "request_id" => too_long.request_id.push('x'),
+                "subject_id" => too_long.subject_id.push('x'),
+                "reservation_token" => too_long.reservation_token.push('x'),
+                _ => unreachable!(),
+            }
+            assert!(too_long.validate().is_err(), "{field} must be bounded");
+        }
+
+        let reconcile = ReconcileUsagePolicyCostInput {
+            request_id: bounded.clone(),
+            subject_id: bounded.clone(),
+            reservation_token: bounded,
+            actual_cost_units: 1,
+            terminal_state: UsagePolicyCostReservationState::Finalized,
+            finalized_at_unix_secs: 200,
+        };
+        assert!(reconcile.validate().is_ok());
+        for field in ["request_id", "subject_id", "reservation_token"] {
+            let mut too_long = reconcile.clone();
+            match field {
+                "request_id" => too_long.request_id.push('x'),
+                "subject_id" => too_long.subject_id.push('x'),
+                "reservation_token" => too_long.reservation_token.push('x'),
+                _ => unreachable!(),
+            }
+            assert!(too_long.validate().is_err(), "{field} must be bounded");
+        }
     }
 }

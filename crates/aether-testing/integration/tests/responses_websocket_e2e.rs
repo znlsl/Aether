@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aether_crypto::{encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY};
-use aether_data::repository::auth::CreateStandaloneApiKeyRecord;
+use aether_data::repository::auth::{CreateStandaloneApiKeyRecord, CreateUserApiKeyRecord};
 use aether_data::repository::wallet::WalletLookupKey;
 use aether_data::{
     DataBackends, DataLayerConfig, DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig,
@@ -159,6 +159,38 @@ async fn continuation_reuses_one_upstream_connection_and_bills_both_turns() -> R
         "each turn gets its own logical request identity"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn weekly_plan_request_limit_counts_turns_but_not_the_websocket_upgrade(
+) -> Result<(), BoxError> {
+    let harness = Harness::start_with_weekly_request_limit(1).await?;
+    let mut client = harness.connect().await?;
+
+    client
+        .send(response_create(json!({"input": "allowed turn"})))
+        .await?;
+    receive_event(&mut client, "response.completed").await?;
+
+    client
+        .send(response_create(json!({"input": "rejected turn"})))
+        .await?;
+    let rejected = receive_error_or_close(&mut client)
+        .await?
+        .ok_or("gateway closed without a plan-limit error event")?;
+    assert_eq!(rejected["status"], json!(429));
+    assert_eq!(
+        rejected.pointer("/error/code"),
+        Some(&json!("plan_usage_limit_exceeded"))
+    );
+    assert_eq!(
+        harness.upstream.observed_events().await.len(),
+        1,
+        "the rejected logical turn must never reach the upstream"
+    );
+
+    client.close(None).await?;
     Ok(())
 }
 
@@ -791,6 +823,28 @@ impl Harness {
             PiiRedaction::Enabled,
         )
         .await
+    }
+
+    async fn start_with_weekly_request_limit(limit: u64) -> Result<Self, BoxError> {
+        let mut harness = Self::start(UpstreamBehavior::CompleteEveryTurn).await?;
+        seed_weekly_request_limit(&harness.database.config, limit).await?;
+        // The gateway may have cached the pre-entitlement auth context during
+        // startup, so restart it after seeding the user-owned key and plan.
+        let data_config = GatewayDataConfig::from_database_config(harness.database.config.clone())
+            .with_encryption_key(DEVELOPMENT_ENCRYPTION_KEY);
+        let state = AppState::new()?
+            .with_data_config_and_background_isolation(data_config, false)?
+            .with_usage_runtime_config(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            })?;
+        let gateway_server = SpawnedServer::start(build_router_with_state(state)).await?;
+        harness.websocket_url = format!(
+            "{}/v1/responses",
+            gateway_server.base_url().replacen("http://", "ws://", 1)
+        );
+        harness._gateway_server = gateway_server;
+        Ok(harness)
     }
 
     async fn start_with(
@@ -1613,6 +1667,144 @@ async fn seed_client_api_key(backends: &DataBackends, user_id: &str) -> Result<(
     {
         return Err("failed to initialize E2E API key wallet".into());
     }
+    Ok(())
+}
+
+async fn seed_weekly_request_limit(
+    database: &SqlDatabaseConfig,
+    limit: u64,
+) -> Result<(), BoxError> {
+    let backends = DataBackends::from_config(DataLayerConfig::from_database(database.clone()))?;
+    let user_id = backends
+        .read()
+        .users()
+        .ok_or("user reader unavailable")?
+        .find_user_auth_by_username("responses-ws-e2e")
+        .await?
+        .ok_or("seeded E2E user unavailable")?
+        .id;
+    backends
+        .write()
+        .auth_api_keys()
+        .ok_or("auth API key writer unavailable")?
+        .delete_standalone_api_key(API_KEY_ID)
+        .await?;
+    backends
+        .write()
+        .auth_api_keys()
+        .ok_or("auth API key writer unavailable")?
+        .create_user_api_key(CreateUserApiKeyRecord {
+            user_id: user_id.clone(),
+            api_key_id: API_KEY_ID.to_string(),
+            key_hash: sha256_hex(CLIENT_API_KEY),
+            key_encrypted: Some(CLIENT_API_KEY.to_string()),
+            name: Some("Responses WebSocket plan-policy E2E".to_string()),
+            allowed_providers: Some(vec![PROVIDER_ID.to_string()]),
+            allowed_api_formats: Some(vec!["openai:responses".to_string()]),
+            allowed_models: Some(vec![PUBLIC_MODEL.to_string()]),
+            ip_rules: None,
+            rate_limit: 0,
+            concurrent_limit: None,
+            force_capabilities: None,
+            is_active: true,
+            expires_at_unix_secs: None,
+            auto_delete_on_expiry: false,
+            total_requests: 0,
+            total_tokens: 0,
+            total_cost_usd: 0.0,
+        })
+        .await?;
+
+    let wallet_id = backends
+        .read()
+        .wallets()
+        .ok_or("wallet reader unavailable")?
+        .find(WalletLookupKey::UserId(&user_id))
+        .await?
+        .ok_or("seeded E2E user wallet unavailable")?
+        .id;
+
+    let pool = backends
+        .sqlite()
+        .ok_or("SQLite backend unavailable")?
+        .pool();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs()
+        .min(i64::MAX as u64) as i64;
+    sqlx::query(
+        r#"
+INSERT INTO billing_plans (
+  id, title, description, price_amount, price_currency, duration_unit,
+  duration_value, enabled, sort_order, max_active_per_user,
+  purchase_limit_scope, entitlements_json, created_at, updated_at
+) VALUES (?, 'WS weekly policy', NULL, 0, 'USD', 'month', 1, 1, 0, 1,
+          'active_period', ?, ?, ?)
+"#,
+    )
+    .bind("plan-responses-ws-weekly")
+    .bind(
+        json!([{
+            "type": "usage_policy",
+            "rules": [{
+                "metric": "request_count",
+                "window": {"kind": "calendar_week"},
+                "limit": limit
+            }]
+        }])
+        .to_string(),
+    )
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+INSERT INTO payment_orders (
+  id, order_no, wallet_id, user_id, amount_usd, pay_currency, status,
+  payment_method, created_at, paid_at, credited_at, expires_at
+) VALUES (?, ?, ?, ?, 0, 'USD', 'paid', 'test', ?, ?, ?, ?)
+"#,
+    )
+    .bind("order-responses-ws-weekly")
+    .bind("order-no-responses-ws-weekly")
+    .bind(&wallet_id)
+    .bind(&user_id)
+    .bind(now)
+    .bind(now)
+    .bind(now)
+    .bind(now + 86_400)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+INSERT INTO user_plan_entitlements (
+  id, user_id, plan_id, payment_order_id, status, starts_at, expires_at,
+  entitlements_snapshot, created_at, updated_at
+) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+"#,
+    )
+    .bind("entitlement-responses-ws-weekly")
+    .bind(&user_id)
+    .bind("plan-responses-ws-weekly")
+    .bind("order-responses-ws-weekly")
+    .bind(now - 1)
+    .bind(now + 86_400)
+    .bind(
+        json!([{
+            "type": "usage_policy",
+            "rules": [{
+                "metric": "request_count",
+                "window": {"kind": "calendar_week"},
+                "limit": limit
+            }]
+        }])
+        .to_string(),
+    )
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

@@ -6,6 +6,7 @@ use aether_data_contracts::repository::settlement::{
     UsagePolicyCostReservationState, UsageSettlementInput,
 };
 use aether_data_contracts::repository::usage::StoredRequestUsageAudit;
+use aether_data_contracts::repository::usage::PLAN_USAGE_RESERVATION_DEFERRED_METADATA_KEY;
 use aether_data_contracts::{DataLayerError, DataLayerError::InvalidInput};
 use async_trait::async_trait;
 
@@ -43,6 +44,9 @@ pub async fn reconcile_usage_policy_cost_for_event(
         }
         UsageEventType::Pending | UsageEventType::Streaming => return Ok(()),
     };
+    if plan_usage_reservation_reconciliation_is_deferred(event.data.request_metadata.as_ref()) {
+        return Ok(());
+    }
     let Some(subject_id) = event.data.user_id.as_deref().and_then(non_empty_trimmed) else {
         return Ok(());
     };
@@ -98,36 +102,38 @@ pub async fn settle_usage_if_needed(
     // Cost reservations are tied to a server-issued per-request token. Legacy usage rows do not
     // have that token, so they must continue through wallet settlement without touching a cost
     // reservation selected only by the client-visible request id.
-    if let (Some(subject_id), Some(reservation_token)) = (
-        usage.user_id.as_deref().and_then(non_empty_trimmed),
-        usage_policy_reservation_token(usage),
-    ) {
-        let (terminal_state, actual_cost_units) = if usage.status == "completed" {
-            (
-                UsagePolicyCostReservationState::Finalized,
-                nonnegative_usd_to_usage_policy_cost_units(
-                    finite_cost(usage.actual_total_cost_usd)?.max(0.0),
-                )
-                .ok_or_else(|| {
-                    InvalidInput(
-                        "usage policy settlement cost exceeds the supported range".to_string(),
+    if !plan_usage_reservation_reconciliation_is_deferred(usage.request_metadata.as_ref()) {
+        if let (Some(subject_id), Some(reservation_token)) = (
+            usage.user_id.as_deref().and_then(non_empty_trimmed),
+            usage_policy_reservation_token(usage),
+        ) {
+            let (terminal_state, actual_cost_units) = if usage.status == "completed" {
+                (
+                    UsagePolicyCostReservationState::Finalized,
+                    nonnegative_usd_to_usage_policy_cost_units(
+                        finite_cost(usage.actual_total_cost_usd)?.max(0.0),
                     )
-                })?,
-            )
-        } else {
-            (UsagePolicyCostReservationState::Released, 0)
-        };
-        let _ = writer
-            .reconcile_usage_policy_cost(ReconcileUsagePolicyCostInput {
-                request_id: usage.request_id.clone(),
-                subject_id: subject_id.to_string(),
-                reservation_token: reservation_token.to_string(),
-                actual_cost_units,
-                terminal_state,
-                finalized_at_unix_secs: finalized_at_unix_secs
-                    .unwrap_or(usage.updated_at_unix_secs),
-            })
-            .await?;
+                    .ok_or_else(|| {
+                        InvalidInput(
+                            "usage policy settlement cost exceeds the supported range".to_string(),
+                        )
+                    })?,
+                )
+            } else {
+                (UsagePolicyCostReservationState::Released, 0)
+            };
+            let _ = writer
+                .reconcile_usage_policy_cost(ReconcileUsagePolicyCostInput {
+                    request_id: usage.request_id.clone(),
+                    subject_id: subject_id.to_string(),
+                    reservation_token: reservation_token.to_string(),
+                    actual_cost_units,
+                    terminal_state,
+                    finalized_at_unix_secs: finalized_at_unix_secs
+                        .unwrap_or(usage.updated_at_unix_secs),
+                })
+                .await?;
+        }
     }
 
     if usage.status == "cancelled" || usage.billing_status != "pending" {
@@ -147,6 +153,14 @@ pub async fn settle_usage_if_needed(
     };
     let _ = writer.settle_usage(input).await?;
     Ok(())
+}
+
+fn plan_usage_reservation_reconciliation_is_deferred(metadata: Option<&serde_json::Value>) -> bool {
+    metadata
+        .and_then(serde_json::Value::as_object)
+        .and_then(|metadata| metadata.get(PLAN_USAGE_RESERVATION_DEFERRED_METADATA_KEY))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn usage_settlement_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -534,6 +548,75 @@ mod tests {
         assert_eq!(reconciliations[0].request_id, "shared-trace");
         assert_eq!(reconciliations[0].reservation_token, "server-token");
         assert_eq!(reconciliations[0].actual_cost_units, 125_000_000);
+    }
+
+    #[tokio::test]
+    async fn deferred_event_keeps_cost_reservation_without_requiring_actual_cost() {
+        let writer = TestSettlementWriter {
+            has_writer: true,
+            ..Default::default()
+        };
+        let event = UsageEvent::new(
+            UsageEventType::Completed,
+            "possibly-sent-request",
+            UsageEventData {
+                user_id: Some("user-1".to_string()),
+                provider_name: "openai".to_string(),
+                model: "gpt-5".to_string(),
+                request_metadata: Some(json!({
+                    "plan_usage_reservation_token": "server-token",
+                    "plan_usage_reservation_deferred": true
+                })),
+                ..UsageEventData::default()
+            },
+        );
+
+        reconcile_usage_policy_cost_for_event(&writer, &event)
+            .await
+            .expect("deferred reconciliation should not require unknown actual cost");
+
+        assert!(writer
+            .reconciliations
+            .lock()
+            .expect("reconciliations lock")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn deferred_stored_usage_skips_cost_reconcile_but_still_settles_wallet() {
+        let writer = TestSettlementWriter {
+            has_writer: true,
+            ..Default::default()
+        };
+        let mut usage = sample_usage();
+        usage.request_metadata = Some(json!({
+            "plan_usage_reservation_token": "server-token",
+            "plan_usage_reservation_deferred": true
+        }));
+
+        settle_usage_if_needed(&writer, &usage)
+            .await
+            .expect("wallet settlement should continue");
+
+        assert!(writer
+            .reconciliations
+            .lock()
+            .expect("reconciliations lock")
+            .is_empty());
+        assert_eq!(
+            writer.inputs.lock().expect("settlement inputs lock").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn deferred_metadata_requires_a_boolean_true() {
+        assert!(super::plan_usage_reservation_reconciliation_is_deferred(
+            Some(&json!({"plan_usage_reservation_deferred": true}))
+        ));
+        assert!(!super::plan_usage_reservation_reconciliation_is_deferred(
+            Some(&json!({"plan_usage_reservation_deferred": "true"}))
+        ));
     }
 
     #[tokio::test]

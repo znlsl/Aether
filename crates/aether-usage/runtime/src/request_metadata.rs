@@ -7,11 +7,11 @@ use aether_data_contracts::repository::usage::{
     extract_provider_actual_service_tier_from_response,
     extract_provider_reasoning_effort_from_body, extract_provider_service_tier_from_body,
     normalize_provider_service_tier, resolve_provider_cache_ttl_minutes, UsageBodyCaptureState,
-    PROVIDER_ACTUAL_SERVICE_TIER_METADATA_KEY, PROVIDER_CACHE_TTL_MINUTES_METADATA_KEY,
-    PROVIDER_REASONING_EFFORT_METADATA_KEY, PROVIDER_SERVICE_TIER_METADATA_KEY,
-    REQUESTED_REASONING_EFFORT_METADATA_KEY, ROUTING_CANDIDATE_SKIP_REASON_METADATA_KEY,
-    ROUTING_FAILURE_DIAGNOSTIC_METADATA_KEY, WEBSOCKET_MODE_METADATA_KEY,
-    WEBSOCKET_TRANSPORT_METADATA_KEY,
+    PLAN_USAGE_RESERVATION_DEFERRED_METADATA_KEY, PROVIDER_ACTUAL_SERVICE_TIER_METADATA_KEY,
+    PROVIDER_CACHE_TTL_MINUTES_METADATA_KEY, PROVIDER_REASONING_EFFORT_METADATA_KEY,
+    PROVIDER_SERVICE_TIER_METADATA_KEY, REQUESTED_REASONING_EFFORT_METADATA_KEY,
+    ROUTING_CANDIDATE_SKIP_REASON_METADATA_KEY, ROUTING_FAILURE_DIAGNOSTIC_METADATA_KEY,
+    WEBSOCKET_MODE_METADATA_KEY, WEBSOCKET_TRANSPORT_METADATA_KEY,
 };
 use serde_json::{json, Map, Value};
 
@@ -353,6 +353,7 @@ fn copy_allowed_metadata_fields(source: &Map<String, Value>, target: &mut Map<St
     copy_bool(source, target, WEBSOCKET_MODE_METADATA_KEY);
     copy_non_empty_string(source, target, WEBSOCKET_TRANSPORT_METADATA_KEY);
     copy_non_empty_string(source, target, "plan_usage_reservation_token");
+    copy_bool(source, target, PLAN_USAGE_RESERVATION_DEFERRED_METADATA_KEY);
     copy_non_empty_string(source, target, "request_path");
     copy_non_empty_string(source, target, "request_query_string");
     copy_non_empty_string(source, target, "request_path_and_query");
@@ -410,6 +411,11 @@ fn move_allowed_metadata_fields(mut source: Map<String, Value>, target: &mut Map
     remove_bool(&mut source, target, WEBSOCKET_MODE_METADATA_KEY);
     remove_non_empty_string(&mut source, target, WEBSOCKET_TRANSPORT_METADATA_KEY);
     remove_non_empty_string(&mut source, target, "plan_usage_reservation_token");
+    remove_bool(
+        &mut source,
+        target,
+        PLAN_USAGE_RESERVATION_DEFERRED_METADATA_KEY,
+    );
     remove_non_empty_string(&mut source, target, "request_path");
     remove_non_empty_string(&mut source, target, "request_query_string");
     remove_non_empty_string(&mut source, target, "request_path_and_query");
@@ -931,6 +937,20 @@ mod tests {
                 "websocket_transport": "responses",
             })
         );
+    }
+
+    #[test]
+    fn sanitizes_plan_usage_reservation_deferred_as_a_boolean() {
+        let metadata = sanitize_usage_request_metadata(Some(json!({
+            "plan_usage_reservation_deferred": true,
+        })))
+        .expect("deferred marker should remain");
+        assert_eq!(metadata, json!({"plan_usage_reservation_deferred": true}));
+
+        assert!(sanitize_usage_request_metadata(Some(json!({
+            "plan_usage_reservation_deferred": "true",
+        })))
+        .is_none());
     }
 
     #[test]

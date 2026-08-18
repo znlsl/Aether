@@ -1,7 +1,5 @@
 //! Connection-level Responses WebSocket FSM.
 
-use std::time::Duration;
-
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
@@ -14,6 +12,7 @@ use super::lifecycle::{
     await_pending_adapter_observation, finalize_active_turn, queue_turn_finalization,
     settle_turn_finalization, spawn_bounded_adapter_observation, PreviousAttemptSettled,
 };
+use super::plan_admission::terminate_responses_websocket_for_plan_permit_loss;
 use super::quota::{
     detach_exhausted_upstream, is_usage_limit_error_event, mark_active_response_retry_unsafe,
     observe_active_response_rebind_safety, retry_active_turn_after_quota_exhaustion,
@@ -137,6 +136,19 @@ pub(super) async fn relay_bound_connection(
                             state,
                             ResponsesWebSocketTurnOutcome::client_disconnected(),
                         ).await;
+                        break;
+                    }
+                    RelayDisposition::PlanUsagePermitLost => {
+                        warn!(
+                            event_name = "responses_websocket_plan_usage_concurrency_lost_before_send",
+                            log_type = "ops",
+                            transport = WEBSOCKET_LOG_TRANSPORT,
+                            websocket = true,
+                            trace_id = %context.trace_id,
+                            "gateway stopped a Responses WebSocket turn before its upstream send after the subscription plan concurrency lease became unhealthy"
+                        );
+                        close_bound_upstream(bound).await;
+                        terminate_responses_websocket_for_plan_permit_loss(client_socket).await;
                         break;
                     }
                     RelayDisposition::UpstreamError(code) => {
@@ -375,18 +387,33 @@ pub(super) async fn relay_bound_connection(
                             )
                             .await
                         }
-                        None => PreviousAttemptSettled::nothing_to_settle(),
+                        None => Some(PreviousAttemptSettled::nothing_to_settle()),
                     };
                     // Planning and binding a replacement carries the complete
                     // scheduler/provider state machine. Keep that large future
                     // off the relay task's stack; the default Tokio/test worker
                     // stack is otherwise easy to exhaust on this rare branch.
-                    if Box::pin(retry_active_turn_after_quota_exhaustion(
-                        bound, state, context, settled,
-                    ))
-                    .await
-                    {
-                        continue;
+                    if let Some(settled) = settled {
+                        match Box::pin(retry_active_turn_after_quota_exhaustion(
+                            bound, state, context, settled,
+                        ))
+                        .await
+                        {
+                            Ok(true) => continue,
+                            Ok(false) => {}
+                            Err(()) => {
+                                finalize_active_turn(
+                                    bound,
+                                    state,
+                                    ResponsesWebSocketTurnOutcome::connection_admission_lost(),
+                                )
+                                .await;
+                                close_bound_upstream(bound).await;
+                                terminate_responses_websocket_for_plan_permit_loss(client_socket)
+                                    .await;
+                                break;
+                            }
+                        }
                     }
                     // 重试失败。旧 attempt 已经结算，logical turn 仍停在
                     // Replanning，所以后面分支里的 end() / finalize_active_turn
@@ -601,23 +628,6 @@ pub(super) async fn relay_bound_connection(
                     break;
                 }
             }
-        }
-    }
-}
-
-pub(super) async fn wait_for_connection_permit_loss(
-    permit: Option<&aether_runtime::AdmissionPermit>,
-) {
-    let Some(permit) = permit else {
-        std::future::pending::<()>().await;
-        return;
-    };
-    let mut health = tokio::time::interval(Duration::from_secs(1));
-    health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        health.tick().await;
-        if !permit.is_healthy() {
-            return;
         }
     }
 }
